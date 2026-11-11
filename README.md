@@ -1,5 +1,6 @@
 # awk
 
+[![CI](https://github.com/hakuxyz/awk/actions/workflows/ci.yml/badge.svg)](https://github.com/hakuxyz/awk/actions/workflows/ci.yml)
 [![Crates.io](https://img.shields.io/crates/v/awk.svg)](https://crates.io/crates/awk)
 [![docs.rs](https://docs.rs/awk/badge.svg)](https://docs.rs/awk)
 [![Downloads](https://img.shields.io/crates/d/awk.svg)](https://crates.io/crates/awk)
@@ -10,7 +11,9 @@
 
 A fast `awk` written in Rust. It is a drop-in replacement for the system `awk`,
 built to be used as a full alternative to GNU awk rather than as a teaching
-implementation.
+implementation. It starts faster than gawk and is competitive on text
+processing, while gawk still leads on numeric-heavy loops; see
+[Benchmarks](#benchmarks).
 
 ![terminal demo](docs/demo.svg)
 
@@ -29,6 +32,9 @@ implementation.
   configuration, single static binary
 
 ## Install
+
+Prebuilt binaries for Linux, macOS and Windows are attached to every
+[GitHub release](https://github.com/hakuxyz/awk/releases).
 
 From crates.io:
 
@@ -62,8 +68,8 @@ usage: awk [-F fs] [-v var=value] [-f progfile | 'prog'] [file ...]
     --version       print version
 ```
 
-Exit codes: `0` success, `1` the script called `exit 1`, `2` usage or runtime
-error.
+Exit codes follow gawk: `0` success, `1` for syntax and usage errors (or a
+script calling `exit 1`), `2` for runtime errors such as an unreadable file.
 
 ```console
 $ echo "hello world" | awk '{print $2}'
@@ -124,18 +130,46 @@ let code = interp.run(&[]);
 assert_eq!(code, 0);
 ```
 
+The library API exists so the CLI engine can be reused, not as a polished
+public interface. It is not stable yet: while the crate is in 0.x, minor
+versions may change it, so pin an exact version if you embed it. A documented,
+stabilized API may follow in a later release.
+
 ## Testing
 
 Two layers keep the behaviour honest:
 
 - `cargo test` runs 39 integration tests against the built CLI
-- A differential harness runs 173 programs under both this `awk` and GNU awk
-  5.4.1 and compares stdout, stderr and the exit status
+- `python3 tools/difftest.py` runs 125 programs under both this `awk` and the
+  system `gawk` and compares stdout, stderr and the exit status
 
 ```console
 $ cargo test
 $ cargo clippy --all-targets
+$ python3 tools/difftest.py
 ```
+
+CI runs the format check, Clippy, both test layers and the differential
+harness on every push (`.github/workflows/ci.yml`).
+
+## Benchmarks
+
+`tools/bench.sh` compares against gawk 5.4.1 on the same machine
+(one warm run per workload, milliseconds):
+
+| workload                     | awk   | gawk  |
+|------------------------------|-------|-------|
+| sum 3M records               | 3170  | 622   |
+| print `$1 $3`, 3M records    | 3152  | 705   |
+| regex filter 1M records      | 4159  | 517   |
+| regex FS, 1M records         | 1065  | 975   |
+| gsub, 1M records             | 1976  | 381   |
+| string FS, 1M records        | 838   | 257   |
+| startup x1000 (`/etc/passwd`)| 1466  | 1878  |
+
+The honest summary: startup and small jobs are faster here, and regex field
+splitting is on par, but gawk's C interpreter is still several times faster on
+record-heavy numeric loops. Run `tools/bench.sh` to reproduce.
 
 ## Known differences from gawk
 

@@ -1,0 +1,59 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            asset: x86_64-linux
+            bin: awk
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            asset: aarch64-macos
+            bin: awk
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            asset: x86_64-windows
+            bin: awk.exe
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+      - name: Package (unix)
+        if: runner.os != 'Windows'
+        run: |
+          stage="awk-${{ matrix.asset }}"
+          mkdir -p "$stage"
+          cp "target/${{ matrix.target }}/release/awk" "$stage/"
+          cp README.md LICENSE "$stage/"
+          tar -czf "$stage.tar.gz" "$stage"
+      - name: Package (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $stage = "awk-${{ matrix.asset }}"
+          New-Item -ItemType Directory -Force $stage | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/awk.exe" $stage/
+          Copy-Item README.md, LICENSE $stage/
+          Compress-Archive -Path $stage -DestinationPath "$stage.zip"
+      - name: Upload release asset
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            awk-${{ matrix.asset }}.tar.gz
+            awk-${{ matrix.asset }}.zip
+          generate_release_notes: true
