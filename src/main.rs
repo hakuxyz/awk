@@ -101,7 +101,26 @@ fn usage() -> ! {
     std::process::exit(2);
 }
 
+/// Restore the default SIGPIPE action. The Rust runtime ignores SIGPIPE, so
+/// writing into a closed pipe would surface as an error instead of ending the
+/// process quietly the way gawk and every other filter do.
+#[cfg(unix)]
+fn reset_sigpipe() {
+    const SIGPIPE: i32 = 13;
+    const SIG_DFL: usize = 0;
+    unsafe extern "C" {
+        fn signal(sig: i32, handler: usize) -> usize;
+    }
+    unsafe {
+        signal(SIGPIPE, SIG_DFL);
+    }
+}
+
+#[cfg(not(unix))]
+fn reset_sigpipe() {}
+
 fn main() {
+    reset_sigpipe();
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut fs: Option<String> = None;
     let mut assigns: Vec<(String, String)> = Vec::new();

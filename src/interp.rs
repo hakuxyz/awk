@@ -40,6 +40,8 @@ pub struct Interp {
     pub input: Box<dyn BufRead>,
     pub stdout: Box<dyn Write>,
     pub stderr: Box<dyn Write>,
+    // line buffered when stdout is a terminal, block buffered otherwise
+    stdout_tty: bool,
     /// one-shot mode: already consumed a line as $0 (for main loop)
     pub pending_line: Option<String>,
     pub match_start: usize,
@@ -83,8 +85,12 @@ impl Interp {
             exit_code: None,
             rng_active: HashMap::new(),
             input: Box::new(BufReader::new(std::io::stdin())),
-            stdout: Box::new(std::io::stdout()),
+            stdout: Box::new(std::io::BufWriter::with_capacity(
+                64 * 1024,
+                std::io::stdout(),
+            )),
             stderr: Box::new(std::io::stderr()),
+            stdout_tty: stdout_is_tty(),
             pending_line: None,
             match_start: 0,
             match_len: 0,
@@ -107,14 +113,35 @@ impl Interp {
     /// Run BEGIN, then main loop over input files (paths), then END.
     pub fn run(&mut self, files: &[String]) -> i32 {
         let code = self.run_inner(files);
+        let _ = self.flush_out();
         self.close_all_outputs();
         code
     }
 
+    /// Flush buffered stdout; a closed pipe becomes the BROKEN_PIPE sentinel.
+    fn flush_out(&mut self) -> Result<(), String> {
+        self.stdout.flush().map_err(|e| {
+            if e.kind() == std::io::ErrorKind::BrokenPipe {
+                BROKEN_PIPE.to_string()
+            } else {
+                e.to_string()
+            }
+        })
+    }
+
+    /// Report a runtime error; a broken stdout ends the run quietly with 0.
+    fn fail(&mut self, e: &str) -> i32 {
+        if e == BROKEN_PIPE {
+            return 0;
+        }
+        let _ = self.flush_out();
+        let _ = writeln!(self.stderr, "awk: {}", e);
+        2
+    }
+
     fn run_inner(&mut self, files: &[String]) -> i32 {
         if let Err(e) = self.run_begin() {
-            let _ = writeln!(self.stderr, "awk: {}", e);
-            return 2;
+            return self.fail(&e);
         }
         if let Some(c) = self.exit_code {
             return c;
@@ -137,6 +164,7 @@ impl Interp {
                 match std::fs::File::open(path) {
                     Ok(f) => self.run_stream(f),
                     Err(e) => {
+                        let _ = self.flush_out();
                         let _ = writeln!(self.stderr, "awk: cannot open {}: {}", path, e);
                         self.exit_code = Some(2);
                         return 2;
@@ -144,8 +172,7 @@ impl Interp {
                 }
             };
             if let Err(e) = res {
-                let _ = writeln!(self.stderr, "awk: {}", e);
-                return 2;
+                return self.fail(&e);
             }
             if let Some(c) = self.exit_code {
                 return c;
@@ -153,8 +180,7 @@ impl Interp {
         }
 
         if let Err(e) = self.run_end() {
-            let _ = writeln!(self.stderr, "awk: {}", e);
-            return 2;
+            return self.fail(&e);
         }
         self.exit_code.unwrap_or(0)
     }
@@ -572,8 +598,22 @@ impl Interp {
     fn emit(&mut self, s: String, redir: &Option<Redir>) -> Result<(), String> {
         match redir {
             None => {
-                self.stdout.write_all(s.as_bytes()).map_err(|e| e.to_string())?;
-                let _ = self.stdout.flush();
+                let res = self
+                    .stdout
+                    .write_all(s.as_bytes())
+                    .and_then(|()| {
+                        if self.stdout_tty {
+                            self.stdout.flush()
+                        } else {
+                            Ok(())
+                        }
+                    });
+                if let Err(e) = res {
+                    if e.kind() == std::io::ErrorKind::BrokenPipe {
+                        return Err(BROKEN_PIPE.to_string());
+                    }
+                    return Err(e.to_string());
+                }
                 Ok(())
             }
             Some(Redir::Trunc(e)) => {
@@ -1332,6 +1372,7 @@ impl Interp {
             "system" => {
                 let v = self.eval(&args[0])?;
                 let cmd = self.conv_str(&v);
+                let _ = self.flush_out();
                 use std::process::Command;
                 let st = Command::new("sh").arg("-c").arg(&cmd).status();
                 Ok(Value::num(match st {
@@ -1681,6 +1722,18 @@ impl Interp {
 
 fn default_print() -> Stmt {
     Stmt::Print(vec![Expr::Field(Box::new(Expr::Num(0.0)))], None)
+}
+
+/// Sentinel error: stdout went away (broken pipe). Reported as a silent
+/// successful exit, the way every Unix filter behaves when piped into `head`.
+const BROKEN_PIPE: &str = "\u{1}broken-pipe\u{1}";
+
+/// True when stdout is a terminal, so output must be flushed per record.
+fn stdout_is_tty() -> bool {
+    unsafe extern "C" {
+        fn isatty(fd: i32) -> i32;
+    }
+    unsafe { isatty(1) == 1 }
 }
 
 /// Expand a replacement string: & is the match, \& a literal ampersand.
