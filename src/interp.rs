@@ -1866,10 +1866,8 @@ const BROKEN_PIPE: &str = "\u{1}broken-pipe\u{1}";
 
 /// True when stdout is a terminal, so output must be flushed per record.
 fn stdout_is_tty() -> bool {
-    unsafe extern "C" {
-        fn isatty(fd: i32) -> i32;
-    }
-    unsafe { isatty(1) == 1 }
+    use std::io::IsTerminal;
+    std::io::stdout().is_terminal()
 }
 
 /// Expand a replacement string: & is the match, \& a literal ampersand.
@@ -2733,9 +2731,10 @@ where
     }
 }
 
-/// Zone abbreviation for a local offset, read from libc so it matches
+/// Zone abbreviation for a local timestamp. Unix reads libc so it matches
 /// what gawk gets from localtime (CET/CEST, EST/EDT, ...).
-fn local_tzname(off_secs: i32) -> String {
+#[cfg(unix)]
+fn local_tzname(p: &Parts) -> String {
     use std::ffi::CStr;
     unsafe extern "C" {
         fn tzset();
@@ -2747,12 +2746,26 @@ fn local_tzname(off_secs: i32) -> String {
         tzset();
         // timezone is always the standard (non-DST) offset, west of UTC
         let std_east = -(timezone as i32);
-        let dst = daylight != 0 && off_secs != std_east;
-        let p = tzname[if dst { 1 } else { 0 }];
-        if p.is_null() {
+        let dst = daylight != 0 && p.off_secs != std_east;
+        let q = tzname[if dst { 1 } else { 0 }];
+        if q.is_null() {
             return String::new();
         }
-        CStr::from_ptr(p).to_string_lossy().into_owned()
+        CStr::from_ptr(q).to_string_lossy().into_owned()
+    }
+}
+
+/// No tzname outside Unix: chrono's abbreviation, else the numeric offset.
+#[cfg(not(unix))]
+fn local_tzname(p: &Parts) -> String {
+    if p.tz.is_empty() {
+        if p.off_secs == 0 {
+            "UTC".to_string()
+        } else {
+            p.off.clone()
+        }
+    } else {
+        p.tz.clone()
     }
 }
 
@@ -2792,7 +2805,7 @@ fn strftime(fmt: &str, ts: i64, utc: bool) -> String {
     p.tz = if utc {
         "GMT".to_string()
     } else {
-        local_tzname(p.off_secs)
+        local_tzname(&p)
     };
     let loc = time_locale();
     let wd_abbr = match loc {
