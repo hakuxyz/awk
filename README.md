@@ -1,6 +1,9 @@
 # awk
 
-[![license](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Crates.io](https://img.shields.io/crates/v/awk.svg)](https://crates.io/crates/awk)
+[![docs.rs](https://docs.rs/awk/badge.svg)](https://docs.rs/awk)
+[![Downloads](https://img.shields.io/crates/d/awk.svg)](https://crates.io/crates/awk)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![rust](https://img.shields.io/badge/rust-1.88%2B-orange.svg)](https://www.rust-lang.org)
 [![posix](https://img.shields.io/badge/POSIX-awk%20compliant-brightgreen.svg)](#features)
 [![gnu](https://img.shields.io/badge/gnu%20awk-5.x%20compatible-9cf.svg)](#gnu-extensions)
@@ -26,6 +29,12 @@ implementation.
   configuration, single static binary
 
 ## Install
+
+From crates.io:
+
+```console
+$ cargo install awk
+```
 
 Build from source:
 
