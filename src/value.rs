@@ -19,18 +19,36 @@ pub struct Scalar {
 
 impl Scalar {
     pub fn empty() -> Self {
-        Scalar { s: String::new(), n: 0.0, strnum: false, uninit: true, numval: false }
+        Scalar {
+            s: String::new(),
+            n: 0.0,
+            strnum: false,
+            uninit: true,
+            numval: false,
+        }
     }
 
     #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: impl Into<String>) -> Self {
         let s = s.into();
         let n = parse_num(&s);
-        Scalar { s, n, strnum: false, uninit: false, numval: false }
+        Scalar {
+            s,
+            n,
+            strnum: false,
+            uninit: false,
+            numval: false,
+        }
     }
 
     pub fn from_num(n: f64) -> Self {
-        Scalar { s: num_to_str(n), n, strnum: false, uninit: false, numval: true }
+        Scalar {
+            s: num_to_str(n),
+            n,
+            strnum: false,
+            uninit: false,
+            numval: true,
+        }
     }
 
     pub fn from_input(s: impl Into<String>) -> Self {
@@ -38,25 +56,23 @@ impl Scalar {
         let n = parse_num(&s);
         // input values keep leading/trailing blanks and still count as strnum
         let looks = num_strict(s.trim());
-        Scalar { s, n, strnum: looks, uninit: false, numval: false }
+        Scalar {
+            s,
+            n,
+            strnum: looks,
+            uninit: false,
+            numval: false,
+        }
     }
 
     /// Numeric value for arithmetic (uninit -> 0).
     pub fn num(&self) -> f64 {
-        if self.uninit {
-            0.0
-        } else {
-            self.n
-        }
+        if self.uninit { 0.0 } else { self.n }
     }
 
     /// String value for concatenation/print (uninit -> "").
     pub fn as_str(&self) -> &str {
-        if self.uninit {
-            ""
-        } else {
-            &self.s
-        }
+        if self.uninit { "" } else { &self.s }
     }
 
     /// Comparison class per POSIX awk.
@@ -250,21 +266,27 @@ pub fn cmp_scalar(a: &Scalar, b: &Scalar) -> std::cmp::Ordering {
         (true, true) => std::cmp::Ordering::Equal,
         (true, false) => {
             if is_numlike(b) {
-                0.0_f64.partial_cmp(&b.num()).unwrap_or(std::cmp::Ordering::Equal)
+                0.0_f64
+                    .partial_cmp(&b.num())
+                    .unwrap_or(std::cmp::Ordering::Equal)
             } else {
                 "".cmp(b.as_str())
             }
         }
         (false, true) => {
             if is_numlike(a) {
-                a.num().partial_cmp(&0.0).unwrap_or(std::cmp::Ordering::Equal)
+                a.num()
+                    .partial_cmp(&0.0)
+                    .unwrap_or(std::cmp::Ordering::Equal)
             } else {
                 a.as_str().cmp("")
             }
         }
         (false, false) => {
             if is_numlike(a) && is_numlike(b) {
-                a.num().partial_cmp(&b.num()).unwrap_or(std::cmp::Ordering::Equal)
+                a.num()
+                    .partial_cmp(&b.num())
+                    .unwrap_or(std::cmp::Ordering::Equal)
             } else {
                 a.as_str().cmp(b.as_str())
             }
@@ -275,4 +297,87 @@ pub fn cmp_scalar(a: &Scalar, b: &Scalar) -> std::cmp::Ordering {
 /// True if scalar should be treated as number in boolean context.
 pub fn cmp_ok_num(s: &Scalar) -> bool {
     is_numlike(s)
+}
+
+/// Process backslash escapes in a -v value or a `var=value` operand.
+pub fn unescape(s: &str) -> String {
+    let mut out = String::new();
+    let b = s.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] != b'\\' {
+            let l = utf8_len(b[i]);
+            out.push_str(std::str::from_utf8(&b[i..i + l]).unwrap_or(""));
+            i += l;
+            continue;
+        }
+        i += 1;
+        if i >= b.len() {
+            out.push('\\');
+            break;
+        }
+        let c = b[i];
+        i += 1;
+        match c {
+            b'\\' => out.push('\\'),
+            b'a' => out.push('\u{7}'),
+            b'b' => out.push('\u{8}'),
+            b'f' => out.push('\u{c}'),
+            b'n' => out.push('\n'),
+            b'r' => out.push('\r'),
+            b't' => out.push('\t'),
+            b'v' => out.push('\u{b}'),
+            b'/' => out.push('/'),
+            b'x' => {
+                let mut v = 0u32;
+                let mut n = 0;
+                while n < 2 && i < b.len() {
+                    if let Some(d) = (b[i] as char).to_digit(16) {
+                        v = v * 16 + d;
+                        i += 1;
+                        n += 1;
+                    } else {
+                        break;
+                    }
+                }
+                if n == 0 {
+                    out.push('x');
+                } else {
+                    out.push(char::from_u32(v).unwrap_or('\0'));
+                }
+            }
+            b'0'..=b'7' => {
+                let mut v = (c - b'0') as u32;
+                let mut n = 1;
+                while n < 3 && i < b.len() && (b'0'..=b'7').contains(&b[i]) {
+                    v = v * 8 + (b[i] - b'0') as u32;
+                    i += 1;
+                    n += 1;
+                }
+                out.push(char::from_u32(v).unwrap_or('\0'));
+            }
+            // unknown escapes keep the letter, like gawk
+            other => {
+                let l = utf8_len(other);
+                if l == 1 {
+                    out.push(other as char);
+                } else {
+                    i += l - 1;
+                }
+            }
+        }
+    }
+    out
+}
+
+fn utf8_len(b: u8) -> usize {
+    if b < 0x80 {
+        1
+    } else if b >> 5 == 0b110 {
+        2
+    } else if b >> 4 == 0b1110 {
+        3
+    } else {
+        4
+    }
 }

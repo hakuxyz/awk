@@ -47,7 +47,10 @@ fn for_sum() {
 
 #[test]
 fn user_function() {
-    let (out, _) = awk(r#"function dbl(x) { return x*2 } BEGIN { print dbl(21) }"#, "");
+    let (out, _) = awk(
+        r#"function dbl(x) { return x*2 } BEGIN { print dbl(21) }"#,
+        "",
+    );
     assert_eq!(out, "42\n");
 }
 
@@ -199,7 +202,10 @@ fn binary_literal_is_zero() {
 
 #[test]
 fn gensub_group_swap() {
-    let (out, _) = awk(r#"BEGIN { print gensub(/(.)(.)/, "[\\2\\1]", "g", "abcd") }"#, "");
+    let (out, _) = awk(
+        r#"BEGIN { print gensub(/(.)(.)/, "[\\2\\1]", "g", "abcd") }"#,
+        "",
+    );
     assert_eq!(out, "[ba][dc]\n");
 }
 
@@ -225,10 +231,7 @@ fn nextfile_skips_rest_of_file() {
         ])
         .output()
         .unwrap();
-    assert_eq!(
-        String::from_utf8_lossy(&out.stdout),
-        "alpha\ngamma\n2\n"
-    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "alpha\ngamma\n2\n");
     let _ = std::fs::remove_file(&f1);
     let _ = std::fs::remove_file(&f2);
 }
@@ -266,7 +269,10 @@ fn modulo_by_zero_is_fatal() {
 
 #[test]
 fn user_function_takes_fewer_args() {
-    let (out, code) = awk(r#"BEGIN { print f(1) } function f(a, b) { return a + b }"#, "");
+    let (out, code) = awk(
+        r#"BEGIN { print f(1) } function f(a, b) { return a + b }"#,
+        "",
+    );
     assert_eq!(out, "1\n");
     assert_eq!(code, 0);
 }
@@ -285,7 +291,10 @@ fn typeof_array_element() {
 
 #[test]
 fn rstart_counts_characters() {
-    let (out, _) = awk(r#"BEGIN { print match("héllo", /l+/), RSTART, RLENGTH }"#, "");
+    let (out, _) = awk(
+        r#"BEGIN { print match("héllo", /l+/), RSTART, RLENGTH }"#,
+        "",
+    );
     assert_eq!(out, "3 3 2\n");
 }
 

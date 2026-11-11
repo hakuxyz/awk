@@ -78,7 +78,13 @@ pub struct Lexer<'a> {
 
 impl<'a> Lexer<'a> {
     pub fn new(src: &'a str) -> Self {
-        Lexer { src: src.as_bytes(), pos: 0, line: 1, pending_newline: false, prev_regex_ok: true }
+        Lexer {
+            src: src.as_bytes(),
+            pos: 0,
+            line: 1,
+            pending_newline: false,
+            prev_regex_ok: true,
+        }
     }
 
     pub fn line(&self) -> usize {
@@ -179,7 +185,9 @@ impl<'a> Lexer<'a> {
                     break;
                 }
             }
-            let s = std::str::from_utf8(&self.src[begin..self.pos]).unwrap().to_string();
+            let s = std::str::from_utf8(&self.src[begin..self.pos])
+                .unwrap()
+                .to_string();
             if let Some(k) = keyword(&s) {
                 return Ok((k, start_line));
             }
@@ -325,11 +333,19 @@ impl<'a> Lexer<'a> {
         self.pos += 1; // opening "
         let mut out = String::new();
         loop {
-            let c = self.bump().ok_or_else(|| format!("line {}: unterminated string", line))?;
+            let c = self
+                .bump()
+                .ok_or_else(|| format!("line {}: unterminated string", line))?;
+            // a raw newline ends the program, like gawk
+            if c == b'\n' {
+                return Err(format!("line {}: unterminated string", line));
+            }
             match c {
                 b'"' => break,
                 b'\\' => {
-                    let e = self.bump().ok_or_else(|| format!("line {}: bad escape", line))?;
+                    let e = self
+                        .bump()
+                        .ok_or_else(|| format!("line {}: bad escape", line))?;
                     match e {
                         b'n' => out.push('\n'),
                         b't' => out.push('\t'),
@@ -356,7 +372,8 @@ impl<'a> Lexer<'a> {
                             let mut v = 0u32;
                             let mut n = 0;
                             while n < 2 {
-                                if let Some(d) = self.peek().and_then(|c| (c as char).to_digit(16)) {
+                                if let Some(d) = self.peek().and_then(|c| (c as char).to_digit(16))
+                                {
                                     v = v * 16 + d;
                                     self.pos += 1;
                                     n += 1;
@@ -394,7 +411,11 @@ impl<'a> Lexer<'a> {
         // 0x1f style hex literal
         if self.peek() == Some(b'0')
             && matches!(self.peek2(), Some(b'x') | Some(b'X'))
-            && self.src.get(self.pos + 2).copied().is_some_and(|c| c.is_ascii_hexdigit())
+            && self
+                .src
+                .get(self.pos + 2)
+                .copied()
+                .is_some_and(|c| c.is_ascii_hexdigit())
         {
             self.pos += 2;
             while self.peek().is_some_and(|c| c.is_ascii_hexdigit()) {
@@ -405,7 +426,8 @@ impl<'a> Lexer<'a> {
             return Ok((Tok::Num(n as f64), line));
         }
         // gawk has no binary literals: 0b101 parses as 0
-        if self.peek() == Some(b'0') && matches!(self.peek2(), Some(b'b') | Some(b'B'))
+        if self.peek() == Some(b'0')
+            && matches!(self.peek2(), Some(b'b') | Some(b'B'))
             && matches!(self.src.get(self.pos + 2), Some(b'0' | b'1'))
         {
             self.pos += 2;
@@ -429,7 +451,9 @@ impl<'a> Lexer<'a> {
             }
         }
         let s = std::str::from_utf8(&self.src[begin..self.pos]).unwrap();
-        let n: f64 = s.parse().map_err(|_| format!("line {}: bad number {}", line, s))?;
+        let n: f64 = s
+            .parse()
+            .map_err(|_| format!("line {}: bad number {}", line, s))?;
         Ok((Tok::Num(n), line))
     }
 
@@ -448,11 +472,15 @@ impl<'a> Lexer<'a> {
         self.pos += 1;
         let mut out = String::new();
         loop {
-            let c = self.bump().ok_or_else(|| format!("line {}: unterminated regex", line))?;
+            let c = self
+                .bump()
+                .ok_or_else(|| format!("line {}: unterminated regex", line))?;
             match c {
                 b'/' => break,
                 b'\\' => {
-                    let e = self.bump().ok_or_else(|| format!("line {}: bad regex escape", line))?;
+                    let e = self
+                        .bump()
+                        .ok_or_else(|| format!("line {}: bad regex escape", line))?;
                     if e == b'\n' {
                         continue;
                     }
@@ -509,8 +537,13 @@ impl<'a> Lexer<'a> {
 /// being the division operator.
 fn regex_ok_after(t: &Tok) -> bool {
     match t {
-        Tok::Num(_) | Tok::Str(_) | Tok::Regex(_) | Tok::RParen | Tok::RBracket
-        | Tok::Inc | Tok::Dec => false,
+        Tok::Num(_)
+        | Tok::Str(_)
+        | Tok::Regex(_)
+        | Tok::RParen
+        | Tok::RBracket
+        | Tok::Inc
+        | Tok::Dec => false,
         Tok::Ident(s) => matches!(s.as_str(), "print" | "printf"),
         _ => true,
     }

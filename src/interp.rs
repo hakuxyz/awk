@@ -35,6 +35,7 @@ pub struct Interp {
     pub ofmt: String,
     pub ignorecase: bool,
     pub argind: f64,
+    pub argc: f64,
     pub exit_code: Option<i32>,
     pub rng_active: HashMap<usize, bool>,
     pub input: Box<dyn BufRead>,
@@ -48,12 +49,21 @@ pub struct Interp {
     pub match_len: usize,
     // set by nextfile: drop the current input file after this record
     nextfile: bool,
+    // compiled patterns are reused across records instead of recompiled
+    re_cache: RefCell<HashMap<String, Regex>>,
+    // ARGV/ARGC were seeded from the command line
+    args_seeded: bool,
     rand_seeded: bool,
     rand_seed: f64,
     // open handles for getline < file / | cmd
     getline_files: HashMap<String, BufReader<std::fs::File>>,
-    getline_cmds:
-        HashMap<String, (BufReader<std::process::ChildStdout>, Option<std::process::Child>)>,
+    getline_cmds: HashMap<
+        String,
+        (
+            BufReader<std::process::ChildStdout>,
+            Option<std::process::Child>,
+        ),
+    >,
     // cached handles for print > file / | cmd
     print_files: HashMap<String, std::fs::File>,
     print_pipes: HashMap<String, std::process::Child>,
@@ -82,6 +92,8 @@ impl Interp {
             ofmt: "%.6g".into(),
             ignorecase: false,
             argind: 0.0,
+            argc: 1.0,
+            args_seeded: false,
             exit_code: None,
             rng_active: HashMap::new(),
             input: Box::new(BufReader::new(std::io::stdin())),
@@ -95,6 +107,7 @@ impl Interp {
             match_start: 0,
             match_len: 0,
             nextfile: false,
+            re_cache: RefCell::new(HashMap::new()),
             rand_seeded: false,
             rand_seed: 1.0,
             getline_files: HashMap::new(),
@@ -112,10 +125,28 @@ impl Interp {
 
     /// Run BEGIN, then main loop over input files (paths), then END.
     pub fn run(&mut self, files: &[String]) -> i32 {
-        let code = self.run_inner(files);
+        if !self.args_seeded {
+            let argv0 = std::env::args().next().unwrap_or_else(|| "awk".into());
+            self.set_args(&argv0, files);
+        }
+        let code = self.run_inner();
         let _ = self.flush_out();
         self.close_all_outputs();
         code
+    }
+
+    /// Seed ARGV and ARGC from the command line. ARGV[0] is the basename of
+    /// the program name, as gawk reports it.
+    pub fn set_args(&mut self, argv0: &str, operands: &[String]) {
+        self.args_seeded = true;
+        self.argc = (operands.len() + 1) as f64;
+        let base = argv0.rsplit('/').next().unwrap_or(argv0);
+        let a = self.ensure_array("ARGV");
+        let mut a = a.borrow_mut();
+        a.insert("0".into(), Value::str(base.to_string()));
+        for (i, o) in operands.iter().enumerate() {
+            a.insert((i + 1).to_string(), Value::str(o.clone()));
+        }
     }
 
     /// Flush buffered stdout; a closed pipe becomes the BROKEN_PIPE sentinel.
@@ -139,7 +170,7 @@ impl Interp {
         2
     }
 
-    fn run_inner(&mut self, files: &[String]) -> i32 {
+    fn run_inner(&mut self) -> i32 {
         if let Err(e) = self.run_begin() {
             return self.fail(&e);
         }
@@ -147,42 +178,84 @@ impl Interp {
             return c;
         }
 
-        let explicit = !files.is_empty();
-        let paths: Vec<String> = if explicit {
-            files.to_vec()
-        } else {
-            vec!["-".into()]
-        };
-
-        for (i, path) in paths.iter().enumerate() {
-            self.argind = if explicit { (i + 1) as f64 } else { 0.0 };
-            self.filename = if path == "-" { String::new() } else { path.clone() };
-            self.fnr = 0.0;
-            let res = if path == "-" {
-                self.run_input()
-            } else {
-                match std::fs::File::open(path) {
-                    Ok(f) => self.run_stream(f),
-                    Err(e) => {
-                        let _ = self.flush_out();
-                        let _ = writeln!(self.stderr, "awk: cannot open {}: {}", path, e);
-                        self.exit_code = Some(2);
-                        return 2;
-                    }
-                }
-            };
-            if let Err(e) = res {
-                return self.fail(&e);
-            }
-            if let Some(c) = self.exit_code {
-                return c;
-            }
+        // a program made of BEGIN rules only never touches the input
+        let begin_only = self
+            .rules
+            .iter()
+            .all(|r| matches!(r.pattern, Some(Pattern::Begin)));
+        if !begin_only && let Some(c) = self.run_input_phase() {
+            return c;
         }
 
         if let Err(e) = self.run_end() {
             return self.fail(&e);
         }
         self.exit_code.unwrap_or(0)
+    }
+
+    /// Walk ARGV[1..ARGC): `name=value` operands assign variables, the rest
+    /// are files. Operands apply in order while input is read, so BEGIN sees
+    /// them unset. With no file operand the standard input is read.
+    fn run_input_phase(&mut self) -> Option<i32> {
+        let mut read_file = false;
+        let mut i = 1i64;
+        while (i as f64) < self.argc {
+            let key = i.to_string();
+            // ARGV is read live: scripts edit it from BEGIN
+            let entry = self
+                .arrays
+                .get("ARGV")
+                .and_then(|a| a.borrow().get(&key).cloned());
+            i += 1;
+            let Some(v) = entry else {
+                continue; // index past ARGV or deleted
+            };
+            let s = self.conv_str(&v);
+            if s.is_empty() {
+                continue; // empty entries are skipped
+            }
+            if let Some((name, val)) = operand_assign(&s) {
+                let val = Value::Scalar(Scalar::from_input(crate::value::unescape(&val)));
+                self.set_var(&name, val);
+                continue;
+            }
+            read_file = true;
+            self.argind = (i - 1) as f64;
+            self.filename = s.clone();
+            self.fnr = 0.0;
+            let res = if s == "-" {
+                self.run_input()
+            } else {
+                match std::fs::File::open(&s) {
+                    Ok(f) => self.run_stream(f),
+                    Err(e) => {
+                        let _ = self.flush_out();
+                        let _ = writeln!(self.stderr, "awk: cannot open {}: {}", s, e);
+                        self.exit_code = Some(2);
+                        return Some(2);
+                    }
+                }
+            };
+            if let Err(e) = res {
+                return Some(self.fail(&e));
+            }
+            if let Some(c) = self.exit_code {
+                return Some(c);
+            }
+        }
+        if !read_file {
+            // no file operand: POSIX says read the standard input
+            self.argind = 0.0;
+            self.filename = "-".into();
+            self.fnr = 0.0;
+            if let Err(e) = self.run_input() {
+                return Some(self.fail(&e));
+            }
+            if let Some(c) = self.exit_code {
+                return Some(c);
+            }
+        }
+        None
     }
 
     /// Flush and close every file/pipe opened by print redirections.
@@ -307,17 +380,22 @@ impl Interp {
             let f = self.get_field(i);
             out.push_str(&self.conv_str(&f));
         }
-        self.globals.insert("$0".to_string(), Value::Scalar(Scalar::from_input(out)));
+        self.globals
+            .insert("$0".to_string(), Value::Scalar(Scalar::from_input(out)));
     }
 
     fn set_field_str(&mut self, i: usize, s: &str) {
         let key = format!("${}", i);
-        self.globals.insert(key, Value::Scalar(Scalar::from_input(s)));
+        self.globals
+            .insert(key, Value::Scalar(Scalar::from_input(s)));
     }
 
     fn get_field(&self, i: usize) -> Value {
         let key = format!("${}", i);
-        self.globals.get(&key).cloned().unwrap_or_else(Value::uninit)
+        self.globals
+            .get(&key)
+            .cloned()
+            .unwrap_or_else(Value::uninit)
     }
 
     fn exec_main_rules(&mut self) -> Result<Flow, String> {
@@ -383,14 +461,25 @@ impl Interp {
         }
     }
 
-    /// Compile a regex, honoring IGNORECASE.
+    /// Compile a regex, honoring IGNORECASE. Patterns are cached because
+    /// the same source is matched against every record.
     fn compile_re(&self, src: &str) -> Result<Regex, String> {
         let pat = if self.ignorecase {
             format!("(?i){}", src)
         } else {
             src.to_string()
         };
-        Regex::new(&pat).map_err(|e| e.to_string())
+        if let Some(rx) = self.re_cache.borrow().get(&pat) {
+            return Ok(rx.clone());
+        }
+        let rx = Regex::new(&pat).map_err(|e| e.to_string())?;
+        let mut cache = self.re_cache.borrow_mut();
+        // bound the cache: dynamic patterns must not grow it forever
+        if cache.len() >= 512 {
+            cache.clear();
+        }
+        cache.insert(pat, rx.clone());
+        Ok(rx)
     }
 
     fn match_re(&mut self, re_src: &str, s: &str) -> bool {
@@ -598,16 +687,13 @@ impl Interp {
     fn emit(&mut self, s: String, redir: &Option<Redir>) -> Result<(), String> {
         match redir {
             None => {
-                let res = self
-                    .stdout
-                    .write_all(s.as_bytes())
-                    .and_then(|()| {
-                        if self.stdout_tty {
-                            self.stdout.flush()
-                        } else {
-                            Ok(())
-                        }
-                    });
+                let res = self.stdout.write_all(s.as_bytes()).and_then(|()| {
+                    if self.stdout_tty {
+                        self.stdout.flush()
+                    } else {
+                        Ok(())
+                    }
+                });
                 if let Err(e) = res {
                     if e.kind() == std::io::ErrorKind::BrokenPipe {
                         return Err(BROKEN_PIPE.to_string());
@@ -888,7 +974,11 @@ impl Interp {
                 let iv = self.eval(idx)?;
                 let k = self.conv_str(&iv);
                 let a = self.ensure_array(arr);
-                Ok(Value::num(if a.borrow().contains_key(&k) { 1.0 } else { 0.0 }))
+                Ok(Value::num(if a.borrow().contains_key(&k) {
+                    1.0
+                } else {
+                    0.0
+                }))
             }
             Expr::Call(name, args) => self.call(name, args),
         }
@@ -896,8 +986,7 @@ impl Interp {
 
     /// Format a number with an awk printf format string.
     fn fmt_num(&self, n: f64, fmt: &str) -> String {
-        do_printf(&[Value::str(fmt), Value::num(n)], &self.convfmt)
-            .unwrap_or_else(|_| int_str(n))
+        do_printf(&[Value::str(fmt), Value::num(n)], &self.convfmt).unwrap_or_else(|_| int_str(n))
     }
 
     /// String form in string contexts: integers stay integers, other
@@ -934,7 +1023,12 @@ impl Interp {
         }
     }
 
-    fn cmp_op(&mut self, a: &Expr, b: &Expr, f: impl Fn(std::cmp::Ordering) -> bool) -> Result<Value, String> {
+    fn cmp_op(
+        &mut self,
+        a: &Expr,
+        b: &Expr,
+        f: impl Fn(std::cmp::Ordering) -> bool,
+    ) -> Result<Value, String> {
         let mut x = self.eval(a)?;
         let mut y = self.eval(b)?;
         if x.is_array() || y.is_array() {
@@ -1019,6 +1113,8 @@ impl Interp {
                 return Ok(Value::num(0.0));
             }
             "ARGIND" => return Ok(Value::num(self.argind)),
+            "ARGC" => return Ok(Value::num(self.argc)),
+            "ARGV" => return Ok(Value::Array(self.ensure_array("ARGV"))),
             "ENVIRON" => {
                 let a = self.ensure_array("ENVIRON");
                 if a.borrow().is_empty() {
@@ -1045,7 +1141,11 @@ impl Interp {
                 "NR" => self.nr = v.to_num(),
                 "NF" => {
                     let old = self.nf as usize;
-                    let n = if v.to_num() < 0.0 { 0 } else { v.to_num() as usize };
+                    let n = if v.to_num() < 0.0 {
+                        0
+                    } else {
+                        v.to_num() as usize
+                    };
                     self.nf = n as f64;
                     for i in n + 1..=old.max(n) {
                         self.globals.remove(&format!("${}", i));
@@ -1065,16 +1165,21 @@ impl Interp {
                 "IGNORECASE" => {
                     let s = self.conv_str(&v);
                     let t = s.trim();
-                    self.ignorecase = !t.is_empty() && t.parse::<f64>().map(|n| n != 0.0).unwrap_or(true);
+                    self.ignorecase =
+                        !t.is_empty() && t.parse::<f64>().map(|n| n != 0.0).unwrap_or(true);
                     self.globals.insert(name.clone(), v);
                 }
                 "ARGIND" => self.argind = v.to_num(),
+                "ARGC" => self.argc = v.to_num(),
                 _ => {
                     if v.is_array() {
-                        self.arrays.insert(name.clone(), match v {
-                            Value::Array(a) => a,
-                            _ => unreachable!(),
-                        });
+                        self.arrays.insert(
+                            name.clone(),
+                            match v {
+                                Value::Array(a) => a,
+                                _ => unreachable!(),
+                            },
+                        );
                     } else {
                         self.arrays.remove(name);
                         self.globals.insert(name.clone(), v);
@@ -1170,7 +1275,10 @@ impl Interp {
             }
             "substr" => {
                 if args.len() < 2 || args.len() > 3 {
-                    return Err(format!("substr: expected 2 or 3 arguments, got {}", args.len()));
+                    return Err(format!(
+                        "substr: expected 2 or 3 arguments, got {}",
+                        args.len()
+                    ));
                 }
                 let v = self.eval(&args[0])?;
                 let s = self.conv_str(&v);
@@ -1210,7 +1318,10 @@ impl Interp {
             }
             "split" => {
                 if args.len() < 2 || args.len() > 3 {
-                    return Err(format!("split: expected 2 or 3 arguments, got {}", args.len()));
+                    return Err(format!(
+                        "split: expected 2 or 3 arguments, got {}",
+                        args.len()
+                    ));
                 }
                 let v = self.eval(&args[0])?;
                 let s = self.conv_str(&v);
@@ -1228,7 +1339,10 @@ impl Interp {
                 a.borrow_mut().clear();
                 let parts = split_fields(&s, &fs, self.ignorecase);
                 for (i, p) in parts.iter().enumerate() {
-                    a.borrow_mut().insert((i + 1).to_string(), Value::Scalar(Scalar::from_input(p.clone())));
+                    a.borrow_mut().insert(
+                        (i + 1).to_string(),
+                        Value::Scalar(Scalar::from_input(p.clone())),
+                    );
                 }
                 Ok(Value::num(parts.len() as f64))
             }
@@ -1271,7 +1385,11 @@ impl Interp {
             }
             "sin" | "cos" | "atan2" | "log" | "exp" | "sqrt" | "int" => {
                 let x = self.eval(&args[0])?.to_num();
-                let y = if args.len() > 1 { self.eval(&args[1])?.to_num() } else { 0.0 };
+                let y = if args.len() > 1 {
+                    self.eval(&args[1])?.to_num()
+                } else {
+                    0.0
+                };
                 let n = match name {
                     "sin" => x.sin(),
                     "cos" => x.cos(),
@@ -1303,7 +1421,8 @@ impl Interp {
                 state ^= state << 13;
                 state ^= state >> 7;
                 state ^= state << 17;
-                self.globals.insert("__rand_state".to_string(), Value::num(state as f64));
+                self.globals
+                    .insert("__rand_state".to_string(), Value::num(state as f64));
                 let r = (state >> 11) as f64 / (1u64 << 53) as f64;
                 Ok(Value::num(r))
             }
@@ -1319,7 +1438,8 @@ impl Interp {
                     self.eval(&args[0])?.to_num()
                 };
                 self.rand_seed = seed;
-                self.globals.insert("__rand_state".to_string(), Value::num(seed));
+                self.globals
+                    .insert("__rand_state".to_string(), Value::num(seed));
                 self.rand_seeded = true;
                 Ok(Value::num(old))
             }
@@ -1397,7 +1517,11 @@ impl Interp {
                     return Ok(Value::num(r as f64));
                 }
                 if args.len() != 2 {
-                    return Err(format!("{}: expected 2 arguments, got {}", name, args.len()));
+                    return Err(format!(
+                        "{}: expected 2 arguments, got {}",
+                        name,
+                        args.len()
+                    ));
                 }
                 let x = self.eval(&args[0])?.to_num();
                 let y = self.eval(&args[1])?.to_num();
@@ -1484,7 +1608,10 @@ impl Interp {
             }
             "strftime" => {
                 if args.is_empty() || args.len() > 3 {
-                    return Err(format!("strftime: expected 1 to 3 arguments, got {}", args.len()));
+                    return Err(format!(
+                        "strftime: expected 1 to 3 arguments, got {}",
+                        args.len()
+                    ));
                 }
                 let f = self.eval(&args[0])?;
                 let fmt = self.conv_str(&f);
@@ -1502,7 +1629,10 @@ impl Interp {
             }
             "mktime" => {
                 if args.is_empty() || args.len() > 2 {
-                    return Err(format!("mktime: expected 1 or 2 arguments, got {}", args.len()));
+                    return Err(format!(
+                        "mktime: expected 1 or 2 arguments, got {}",
+                        args.len()
+                    ));
                 }
                 let v = self.eval(&args[0])?;
                 let spec = self.conv_str(&v);
@@ -1545,8 +1675,7 @@ impl Interp {
                 if !self.getline_files.contains_key(&path) {
                     match std::fs::File::open(&path) {
                         Ok(f) => {
-                            self.getline_files
-                                .insert(path.clone(), BufReader::new(f));
+                            self.getline_files.insert(path.clone(), BufReader::new(f));
                         }
                         Err(_) => return Ok(Value::num(-1.0)),
                     }
@@ -1626,7 +1755,10 @@ impl Interp {
     /// gensub(re, repl, how, [target]) returns the substituted string.
     fn builtin_gensub(&mut self, args: &[Expr]) -> Result<Value, String> {
         if args.len() < 3 || args.len() > 4 {
-            return Err(format!("gensub: expected 3 or 4 arguments, got {}", args.len()));
+            return Err(format!(
+                "gensub: expected 3 or 4 arguments, got {}",
+                args.len()
+            ));
         }
         let re_src = self.regex_of(&args[0])?;
         let rv = self.eval(&args[1])?;
@@ -1638,7 +1770,7 @@ impl Interp {
             .cloned()
             .unwrap_or_else(|| Expr::Field(Box::new(Expr::Num(0.0))));
         let tv = self.eval(&target)?;
-                let s = self.conv_str(&tv);
+        let s = self.conv_str(&tv);
         let re = self.compile_re(&re_src)?;
         let out = if how == "g" {
             re.replace_all(&s, |caps: &regex::Captures| expand_repl(&repl, caps, true))
@@ -1669,7 +1801,11 @@ impl Interp {
     /// asort(arr[, dest]) sorts values, asorti sorts indices (as strings).
     fn builtin_asort(&mut self, name: &str, args: &[Expr]) -> Result<Value, String> {
         if args.is_empty() || args.len() > 2 {
-            return Err(format!("{}: expected 1 or 2 arguments, got {}", name, args.len()));
+            return Err(format!(
+                "{}: expected 1 or 2 arguments, got {}",
+                name,
+                args.len()
+            ));
         }
         let src_name = match &args[0] {
             Expr::Var(n) => n.clone(),
@@ -1786,6 +1922,23 @@ fn is_lvalue(e: &Expr) -> bool {
     matches!(e, Expr::Var(_) | Expr::Field(_) | Expr::Index(..))
 }
 
+/// Split a `name=value` operand. Only a plain identifier makes it an
+/// assignment; `a[1]=5`, `1x=5` and `=x=7` are file names.
+fn operand_assign(s: &str) -> Option<(String, String)> {
+    let b = s.as_bytes();
+    if b.is_empty() || !(b[0].is_ascii_alphabetic() || b[0] == b'_') {
+        return None;
+    }
+    let mut i = 1;
+    while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
+        i += 1;
+    }
+    if i >= b.len() || b[i] != b'=' {
+        return None;
+    }
+    Some((s[..i].to_string(), s[i + 1..].to_string()))
+}
+
 fn utf8_len(b: u8) -> usize {
     if b < 0x80 {
         1
@@ -1796,6 +1949,13 @@ fn utf8_len(b: u8) -> usize {
     } else {
         4
     }
+}
+
+// Compiled field separators, keyed by pattern text. FS is applied to every
+// record, so recompiling it each time dominates runtime scripts.
+thread_local! {
+    static SPLIT_RE_CACHE: RefCell<HashMap<String, Option<Regex>>> =
+        RefCell::new(HashMap::new());
 }
 
 /// Split a record into fields per FS. An empty record yields no fields,
@@ -1812,21 +1972,37 @@ fn split_fields(rec: &str, fs: &str, ignorecase: bool) -> Vec<String> {
     }
     if fs.len() >= 2 && fs.starts_with('/') && fs.ends_with('/') {
         let src = &fs[1..fs.len() - 1];
-        let pat = if ignorecase { format!("(?i){}", src) } else { src.to_string() };
-        if let Ok(rx) = Regex::new(&pat) {
-            return rx.split(rec).map(|s| s.to_string()).collect();
-        }
-        return vec![rec.to_string()];
+        return split_ere(rec, src, ignorecase);
     }
     if fs.chars().count() == 1 {
         return rec.split(fs).map(|s| s.to_string()).collect();
     }
     // multi-character FS is an ERE
-    let pat = if ignorecase { format!("(?i){}", fs) } else { fs.to_string() };
-    match Regex::new(&pat) {
-        Ok(rx) => rx.split(rec).map(|s| s.to_string()).collect(),
-        Err(_) => vec![rec.to_string()],
-    }
+    split_ere(rec, fs, ignorecase)
+}
+
+/// Split with an ERE separator, reusing a compiled pattern from the cache.
+fn split_ere(rec: &str, src: &str, ignorecase: bool) -> Vec<String> {
+    let pat = if ignorecase {
+        format!("(?i){}", src)
+    } else {
+        src.to_string()
+    };
+    SPLIT_RE_CACHE.with(|c| {
+        if let Some(Some(rx)) = c.borrow().get(&pat) {
+            return rx.split(rec).map(|s| s.to_string()).collect();
+        }
+        let built = Regex::new(&pat).ok();
+        let mut cache = c.borrow_mut();
+        if cache.len() >= 512 {
+            cache.clear();
+        }
+        cache.insert(pat, built.clone());
+        match built {
+            Some(rx) => rx.split(rec).map(|s| s.to_string()).collect(),
+            None => vec![rec.to_string()],
+        }
+    })
 }
 
 // Guard against CONVFMT values that would convert a number again.
@@ -1965,7 +2141,11 @@ fn do_printf(args: &[Value], convfmt: &str) -> Result<String, String> {
                 while fi < fb.len() && fb[fi].is_ascii_digit() {
                     fi += 1;
                 }
-                prec = Some(if fi > ps { fmt[ps..fi].parse().unwrap_or(0) } else { 0 });
+                prec = Some(if fi > ps {
+                    fmt[ps..fi].parse().unwrap_or(0)
+                } else {
+                    0
+                });
             }
         }
         // length modifiers are accepted and ignored
@@ -1980,8 +2160,21 @@ fn do_printf(args: &[Value], convfmt: &str) -> Result<String, String> {
         fi += 1;
         if !matches!(
             conv,
-            b'd' | b'i' | b'u' | b'x' | b'X' | b'o' | b'f' | b'F' | b'e' | b'E' | b'g'
-                | b'G' | b'a' | b'A' | b'c' | b's'
+            b'd' | b'i'
+                | b'u'
+                | b'x'
+                | b'X'
+                | b'o'
+                | b'f'
+                | b'F'
+                | b'e'
+                | b'E'
+                | b'g'
+                | b'G'
+                | b'a'
+                | b'A'
+                | b'c'
+                | b's'
         ) {
             // unknown conversion: copy verbatim, no argument is consumed
             out.push_str(&fmt[start..fi]);
@@ -1993,7 +2186,16 @@ fn do_printf(args: &[Value], convfmt: &str) -> Result<String, String> {
         let val = &args[ai];
         ai += 1;
         let piece = format_conv(
-            conv, val, width as usize, left, zero, plus, space, alt, prec, convfmt,
+            conv,
+            val,
+            width as usize,
+            left,
+            zero,
+            plus,
+            space,
+            alt,
+            prec,
+            convfmt,
         );
         out.push_str(&piece);
     }
@@ -2015,8 +2217,19 @@ fn format_conv(
 ) -> String {
     if matches!(
         conv,
-        b'd' | b'i' | b'u' | b'x' | b'X' | b'o' | b'f' | b'F' | b'e' | b'E' | b'g' | b'G'
-            | b'a' | b'A'
+        b'd' | b'i'
+            | b'u'
+            | b'x'
+            | b'X'
+            | b'o'
+            | b'f'
+            | b'F'
+            | b'e'
+            | b'E'
+            | b'g'
+            | b'G'
+            | b'a'
+            | b'A'
     ) {
         let n = val.to_num();
         if !n.is_finite() {
@@ -2192,11 +2405,19 @@ fn force_dot_e(s: String, upper: bool) -> String {
 /// %g: significant digits, style e when the exponent is out of range.
 fn fmt_g(n: f64, p: usize, upper: bool, alt: bool) -> String {
     if !n.is_finite() {
-        return if upper { format!("{:E}", n) } else { format!("{:e}", n) };
+        return if upper {
+            format!("{:E}", n)
+        } else {
+            format!("{:e}", n)
+        };
     }
     let p = if p == 0 { 1 } else { p };
     let es = format!("{:e}", n);
-    let exp: i32 = es.split('e').nth(1).and_then(|x| x.parse().ok()).unwrap_or(0);
+    let exp: i32 = es
+        .split('e')
+        .nth(1)
+        .and_then(|x| x.parse().ok())
+        .unwrap_or(0);
     if exp < -4 || exp >= p as i32 {
         let s = fmt_e(n, p - 1, upper);
         if alt {
@@ -2226,7 +2447,11 @@ fn fmt_g(n: f64, p: usize, upper: bool, alt: bool) -> String {
 /// %a: IEEE hex float such as 0x1.999999999999ap-4.
 fn fmt_a(n: f64, prec: Option<usize>, upper: bool) -> String {
     if n.is_nan() || n.is_infinite() {
-        return if upper { format!("{:E}", n) } else { format!("{:e}", n) };
+        return if upper {
+            format!("{:E}", n)
+        } else {
+            format!("{:e}", n)
+        };
     }
     let neg = n.is_sign_negative();
     let a = n.abs();
@@ -2353,11 +2578,7 @@ fn parse_strtonum(s: &str) -> f64 {
     let rb = rest.as_bytes();
     let scale = |v: i128| -> f64 {
         let v = v as f64;
-        if neg {
-            -v
-        } else {
-            v
-        }
+        if neg { -v } else { v }
     };
     // 0x1f style hex
     if rb.len() > 2 && rb[0] == b'0' && matches!(rb[1], b'x' | b'X') && rb[2].is_ascii_hexdigit() {
@@ -2365,7 +2586,11 @@ fn parse_strtonum(s: &str) -> f64 {
         let mut v: i128 = 0;
         while j < rb.len() && rb[j].is_ascii_hexdigit() {
             let c = rb[j];
-            let d = if c.is_ascii_digit() { (c - b'0') as i128 } else { ((c | 0x20) - b'a' + 10) as i128 };
+            let d = if c.is_ascii_digit() {
+                (c - b'0') as i128
+            } else {
+                ((c | 0x20) - b'a' + 10) as i128
+            };
             v = v * 16 + d;
             j += 1;
         }
@@ -2390,11 +2615,7 @@ fn parse_strtonum(s: &str) -> f64 {
         return if neg { -v } else { v };
     }
     let v = crate::value::parse_num(rest);
-    if neg {
-        -v
-    } else {
-        v
-    }
+    if neg { -v } else { v }
 }
 
 /// Names used by strftime, chosen from LC_ALL / LC_TIME / LANG.
@@ -2422,25 +2643,57 @@ fn time_locale() -> TimeLocale {
 
 const EN_WD_ABBR: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
 const EN_WD_FULL: [&str; 7] = [
-    "Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday",
+    "Sunday",
+    "Monday",
+    "Tuesday",
+    "Wednesday",
+    "Thursday",
+    "Friday",
+    "Saturday",
 ];
 const EN_MO_ABBR: [&str; 12] = [
     "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
 ];
 const EN_MO_FULL: [&str; 12] = [
-    "January", "February", "March", "April", "May", "June", "July", "August", "September",
-    "October", "November", "December",
+    "January",
+    "February",
+    "March",
+    "April",
+    "May",
+    "June",
+    "July",
+    "August",
+    "September",
+    "October",
+    "November",
+    "December",
 ];
 const DE_WD_ABBR: [&str; 7] = ["So", "Mo", "Di", "Mi", "Do", "Fr", "Sa"];
 const DE_WD_FULL: [&str; 7] = [
-    "Sonntag", "Montag", "Dienstag", "Mittwoch", "Donnerstag", "Freitag", "Samstag",
+    "Sonntag",
+    "Montag",
+    "Dienstag",
+    "Mittwoch",
+    "Donnerstag",
+    "Freitag",
+    "Samstag",
 ];
 const DE_MO_ABBR: [&str; 12] = [
     "Jan", "Feb", "Mär", "Apr", "Mai", "Jun", "Jul", "Aug", "Sep", "Okt", "Nov", "Dez",
 ];
 const DE_MO_FULL: [&str; 12] = [
-    "Januar", "Februar", "März", "April", "Mai", "Juni", "Juli", "August", "September",
-    "Oktober", "November", "Dezember",
+    "Januar",
+    "Februar",
+    "März",
+    "April",
+    "Mai",
+    "Juni",
+    "Juli",
+    "August",
+    "September",
+    "Oktober",
+    "November",
+    "Dezember",
 ];
 
 /// Broken down calendar fields shared by both time zones.
@@ -2505,11 +2758,7 @@ fn local_tzname(off_secs: i32) -> String {
 
 fn hour12(h: u32) -> u32 {
     let v = h % 12;
-    if v == 0 {
-        12
-    } else {
-        v
-    }
+    if v == 0 { 12 } else { v }
 }
 
 /// %U / %W: week of year, first week starts on Sunday / Monday.
@@ -2537,7 +2786,9 @@ fn strftime(fmt: &str, ts: i64, utc: bool) -> String {
     } else {
         Local.timestamp_opt(ts, 0).single().map(|dt| parts_of(&dt))
     };
-    let Some(mut p) = parts else { return String::new() };
+    let Some(mut p) = parts else {
+        return String::new();
+    };
     p.tz = if utc {
         "GMT".to_string()
     } else {
@@ -2562,11 +2813,23 @@ fn strftime(fmt: &str, ts: i64, utc: bool) -> String {
     };
     let ampm = match loc {
         TimeLocale::De => "",
-        TimeLocale::C => if p.h < 12 { "AM" } else { "PM" },
+        TimeLocale::C => {
+            if p.h < 12 {
+                "AM"
+            } else {
+                "PM"
+            }
+        }
     };
     let ampm_l = match loc {
         TimeLocale::De => "",
-        TimeLocale::C => if p.h < 12 { "am" } else { "pm" },
+        TimeLocale::C => {
+            if p.h < 12 {
+                "am"
+            } else {
+                "pm"
+            }
+        }
     };
     let (iso_y, iso_w) = iso_week(&p);
     let mut out = String::new();
@@ -2623,9 +2886,7 @@ fn strftime(fmt: &str, ts: i64, utc: bool) -> String {
             b'w' => out.push_str(&format!("{}", p.wd)),
             b'X' => out.push_str(&format!("{:02}:{:02}:{:02}", p.h, p.mi, p.s)),
             b'x' => match loc {
-                TimeLocale::De => {
-                    out.push_str(&format!("{:02}.{:02}.{:04}", p.d, p.mo, p.y))
-                }
+                TimeLocale::De => out.push_str(&format!("{:02}.{:02}.{:04}", p.d, p.mo, p.y)),
                 TimeLocale::C => out.push_str(&format!(
                     "{:02}/{:02}/{:02}",
                     p.mo,
@@ -2692,8 +2953,7 @@ fn mktime(spec: &str, utc: bool) -> f64 {
             Err(_) => return -1.0,
         }
     }
-    let (y, mon, day, hour, min, sec) =
-        (nums[0], nums[1], nums[2], nums[3], nums[4], nums[5]);
+    let (y, mon, day, hour, min, sec) = (nums[0], nums[1], nums[2], nums[3], nums[4], nums[5]);
     use chrono::{Duration, Local, NaiveDate, NaiveTime, Offset, TimeZone};
     // months are 1-based and carry into the year
     let total_mon = y * 12 + (mon - 1);
@@ -2741,7 +3001,8 @@ fn mktime(spec: &str, utc: bool) -> f64 {
     // no fixed point: DST gap. gawk (via glibc mktime) then uses the
     // offset that was in effect before the transition.
     let utc_naive = naive.and_utc().timestamp();
-    let before = Local.timestamp_opt(utc_naive - 3 * 3600, 0)
+    let before = Local
+        .timestamp_opt(utc_naive - 3 * 3600, 0)
         .single()
         .map(|d| d.offset().fix().local_minus_utc() as i64)
         .unwrap_or(0);

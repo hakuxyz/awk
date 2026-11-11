@@ -18,7 +18,13 @@ impl<'a> Parser<'a> {
     pub fn new(src: &'a str) -> Result<Self, String> {
         let mut lx = Lexer::new(src);
         let (cur, line) = lx.next()?;
-        Ok(Parser { lx, cur, line, no_gt: false, peeked: None })
+        Ok(Parser {
+            lx,
+            cur,
+            line,
+            no_gt: false,
+            peeked: None,
+        })
     }
 
     /// Advance to the next token, preferring an already peeked one.
@@ -52,7 +58,10 @@ impl<'a> Parser<'a> {
         if self.cur == t {
             self.bump()
         } else {
-            Err(format!("line {}: expected {:?}, got {:?}", self.line, t, self.cur))
+            Err(format!(
+                "line {}: expected {:?}, got {:?}",
+                self.line, t, self.cur
+            ))
         }
     }
 
@@ -77,7 +86,10 @@ impl<'a> Parser<'a> {
         if self.cur == Tok::Function {
             // stash as a special rule? handled by parse_functions first.
             // For simplicity functions are parsed in parse_program via separate pass.
-            return Err(format!("line {}: function must be at top level before rules", self.line));
+            return Err(format!(
+                "line {}: function must be at top level before rules",
+                self.line
+            ));
         }
 
         let pattern = if self.cur == Tok::Begin {
@@ -533,7 +545,9 @@ impl<'a> Parser<'a> {
                 self.bump()?;
                 let r = self.parse_and()?;
                 e = Expr::Or(Box::new(e), Box::new(r));
-            } else if matches!(&self.cur, Tok::Ident(s) if s == "|") && matches!(self.peek()?, Tok::Getline) {
+            } else if matches!(&self.cur, Tok::Ident(s) if s == "|")
+                && matches!(self.peek()?, Tok::Getline)
+            {
                 // `cmd | getline [var]`: the left side is the command
                 self.bump()?;
                 self.bump()?; // getline
@@ -683,12 +697,7 @@ impl<'a> Parser<'a> {
     fn concat_start(&self) -> bool {
         matches!(
             self.cur,
-            Tok::Num(_)
-                | Tok::Str(_)
-                | Tok::Regex(_)
-                | Tok::Dollar
-                | Tok::LParen
-                | Tok::LBracket
+            Tok::Num(_) | Tok::Str(_) | Tok::Regex(_) | Tok::Dollar | Tok::LParen | Tok::LBracket
         ) || matches!(&self.cur, Tok::Ident(s) if s != "|")
     }
 
@@ -895,20 +904,17 @@ impl<'a> Parser<'a> {
                 } else {
                     None
                 };
-                Ok(Expr::Call(
-                    "getline".into(),
-                    {
-                        let mut a = vec![target];
-                        if let Some(s) = src {
-                            a.push(match s {
-                                GetlineSrc::File(f) => Expr::Call("<".into(), vec![f]),
-                                GetlineSrc::Cmd(c) => Expr::Call("|".into(), vec![c]),
-                                GetlineSrc::None | GetlineSrc::VarFile(_, _) => Expr::Num(0.0),
-                            });
-                        }
-                        a
-                    },
-                ))
+                Ok(Expr::Call("getline".into(), {
+                    let mut a = vec![target];
+                    if let Some(s) = src {
+                        a.push(match s {
+                            GetlineSrc::File(f) => Expr::Call("<".into(), vec![f]),
+                            GetlineSrc::Cmd(c) => Expr::Call("|".into(), vec![c]),
+                            GetlineSrc::None | GetlineSrc::VarFile(_, _) => Expr::Num(0.0),
+                        });
+                    }
+                    a
+                }))
             }
             other => Err(format!("line {}: unexpected token {:?}", self.line, other)),
         }
@@ -998,7 +1004,11 @@ fn split_functions(src: &str) -> Result<(Vec<FuncDef>, String), String> {
             };
             let mut j = idx + 2;
             if tokens[j].0 != Tok::LParen {
-                return Err(format!("line {}: expected ( after {}", tokens[idx + 1].1, name));
+                return Err(format!(
+                    "line {}: expected ( after {}",
+                    tokens[idx + 1].1,
+                    name
+                ));
             }
             j += 1;
             let mut params = Vec::new();
@@ -1015,7 +1025,10 @@ fn split_functions(src: &str) -> Result<(Vec<FuncDef>, String), String> {
             j += 1; // )
             // body must be {
             if tokens[j].0 != Tok::LBrace {
-                return Err(format!("line {}: expected {{ after function {}", tokens[j].1, name));
+                return Err(format!(
+                    "line {}: expected {{ after function {}",
+                    tokens[j].1, name
+                ));
             }
             // find matching brace by depth
             let mut depth = 0i32;
@@ -1029,7 +1042,12 @@ fn split_functions(src: &str) -> Result<(Vec<FuncDef>, String), String> {
                             break;
                         }
                     }
-                    Tok::Eof => return Err(format!("line {}: unclosed function {}", tokens[body_start_tok].1, name)),
+                    Tok::Eof => {
+                        return Err(format!(
+                            "line {}: unclosed function {}",
+                            tokens[body_start_tok].1, name
+                        ));
+                    }
                     _ => {}
                 }
                 j += 1;
@@ -1041,7 +1059,11 @@ fn split_functions(src: &str) -> Result<(Vec<FuncDef>, String), String> {
             let body_src = &src[start..end];
             let mut bp = Parser::new(body_src)?;
             let body = bp.parse_block_stmt()?;
-            funcs.push(FuncDef { name, params, body: Rc::new(body) });
+            funcs.push(FuncDef {
+                name,
+                params,
+                body: Rc::new(body),
+            });
             idx = body_end_tok + 1;
             out.push(' '); // placeholder: remove function from remaining program
             continue;

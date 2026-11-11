@@ -30,7 +30,12 @@ pub enum Stmt {
     If(Expr, Box<Stmt>, Option<Box<Stmt>>),
     While(Expr, Box<Stmt>),
     DoWhile(Box<Stmt>, Expr),
-    For(Option<Box<Stmt>>, Option<Expr>, Option<Box<Stmt>>, Box<Stmt>),
+    For(
+        Option<Box<Stmt>>,
+        Option<Expr>,
+        Option<Box<Stmt>>,
+        Box<Stmt>,
+    ),
     ForIn(Vec<String>, String, Box<Stmt>),
     Break,
     Continue,
@@ -47,9 +52,9 @@ pub enum Stmt {
 
 #[derive(Debug, Clone)]
 pub enum Redir {
-    Trunc(Expr),   // >
-    Append(Expr),  // >>
-    Pipe(Expr),    // |
+    Trunc(Expr),  // >
+    Append(Expr), // >>
+    Pipe(Expr),   // |
 }
 
 #[derive(Debug, Clone)]

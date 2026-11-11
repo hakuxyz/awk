@@ -1,93 +1,10 @@
 //! awk CLI: POSIX-compatible entry point.
 
+use awk::Value;
 use awk::interp::Interp;
 use awk::parser::parse_full;
-use awk::value::Scalar;
-use awk::Value;
+use awk::value::{Scalar, unescape};
 use std::io::Write;
-
-/// Process backslash escapes in a -v value or -F field separator.
-fn unescape(s: &str) -> String {
-    let mut out = String::new();
-    let b = s.as_bytes();
-    let mut i = 0;
-    while i < b.len() {
-        if b[i] != b'\\' {
-            let l = utf8_len(b[i]);
-            out.push_str(std::str::from_utf8(&b[i..i + l]).unwrap_or(""));
-            i += l;
-            continue;
-        }
-        i += 1;
-        if i >= b.len() {
-            out.push('\\');
-            break;
-        }
-        let c = b[i];
-        i += 1;
-        match c {
-            b'\\' => out.push('\\'),
-            b'a' => out.push('\u{7}'),
-            b'b' => out.push('\u{8}'),
-            b'f' => out.push('\u{c}'),
-            b'n' => out.push('\n'),
-            b'r' => out.push('\r'),
-            b't' => out.push('\t'),
-            b'v' => out.push('\u{b}'),
-            b'/' => out.push('/'),
-            b'x' => {
-                let mut v = 0u32;
-                let mut n = 0;
-                while n < 2 && i < b.len() {
-                    if let Some(d) = (b[i] as char).to_digit(16) {
-                        v = v * 16 + d;
-                        i += 1;
-                        n += 1;
-                    } else {
-                        break;
-                    }
-                }
-                if n == 0 {
-                    out.push('x');
-                } else {
-                    out.push(char::from_u32(v).unwrap_or('\0'));
-                }
-            }
-            b'0'..=b'7' => {
-                let mut v = (c - b'0') as u32;
-                let mut n = 1;
-                while n < 3 && i < b.len() && (b'0'..=b'7').contains(&b[i]) {
-                    v = v * 8 + (b[i] - b'0') as u32;
-                    i += 1;
-                    n += 1;
-                }
-                out.push(char::from_u32(v).unwrap_or('\0'));
-            }
-            // unknown escapes keep the letter, like gawk
-            other => {
-                let l = utf8_len(other);
-                if l == 1 {
-                    out.push(other as char);
-                } else {
-                    i += l - 1;
-                }
-            }
-        }
-    }
-    out
-}
-
-fn utf8_len(b: u8) -> usize {
-    if b < 0x80 {
-        1
-    } else if b >> 5 == 0b110 {
-        2
-    } else if b >> 4 == 0b1110 {
-        3
-    } else {
-        4
-    }
-}
 
 fn usage() -> ! {
     eprintln!(
@@ -98,7 +15,7 @@ fn usage() -> ! {
          \t-f progfile\tread program from file\n\
          \t--version\tprint version"
     );
-    std::process::exit(2);
+    std::process::exit(1);
 }
 
 /// Restore the default SIGPIPE action. The Rust runtime ignores SIGPIPE, so
@@ -128,9 +45,17 @@ fn main() {
     let mut positional: Vec<String> = Vec::new();
     let mut i = 0;
     let mut prog_src: Option<String> = None;
+    // gawk parses options only up to the first operand; everything after
+    // the program (or after the first file with -f) is an operand
+    let mut operands = false;
 
     while i < args.len() {
         let a = &args[i];
+        if operands {
+            positional.push(a.clone());
+            i += 1;
+            continue;
+        }
         if a == "--version" {
             println!("awk {}", env!("CARGO_PKG_VERSION"));
             std::process::exit(0);
@@ -182,14 +107,15 @@ fn main() {
         } else if a.starts_with('-') && a.len() > 1 && a != "-" {
             // unknown option
             eprintln!("awk: unrecognized option {}", a);
-            std::process::exit(2);
+            std::process::exit(1);
+        } else if prog_file.is_none() && prog_src.is_none() {
+            // first non-option is the program
+            prog_src = Some(a.clone());
+            operands = true;
         } else {
-            // first non-option is program if no -f
-            if prog_file.is_none() && prog_src.is_none() {
-                prog_src = Some(a.clone());
-            } else {
-                positional.push(a.clone());
-            }
+            // with -f the first non-option is already a file operand
+            positional.push(a.clone());
+            operands = true;
         }
         i += 1;
     }
@@ -212,7 +138,7 @@ fn main() {
         Ok(x) => x,
         Err(e) => {
             eprintln!("awk: {}", e);
-            std::process::exit(2);
+            std::process::exit(1);
         }
     };
 
