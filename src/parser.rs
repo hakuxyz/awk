@@ -10,20 +10,42 @@ pub struct Parser<'a> {
     line: usize,
     // in print args, bare `>` is redirect not comparison
     no_gt: bool,
+    // token already read from the lexer but not yet consumed
+    peeked: Option<(Tok, usize)>,
 }
 
 impl<'a> Parser<'a> {
     pub fn new(src: &'a str) -> Result<Self, String> {
         let mut lx = Lexer::new(src);
         let (cur, line) = lx.next()?;
-        Ok(Parser { lx, cur, line, no_gt: false })
+        Ok(Parser { lx, cur, line, no_gt: false, peeked: None })
     }
 
-    fn bump(&mut self) -> Result<(), String> {
+    /// Advance to the next token, preferring an already peeked one.
+    fn advance(&mut self) -> Result<(), String> {
+        if let Some((t, l)) = self.peeked.take() {
+            self.cur = t;
+            self.line = l;
+            return Ok(());
+        }
         let (t, l) = self.lx.next()?;
         self.cur = t;
         self.line = l;
         Ok(())
+    }
+
+    fn bump(&mut self) -> Result<(), String> {
+        self.advance()
+    }
+
+    /// Look one token ahead without consuming it.
+    fn peek(&mut self) -> Result<Tok, String> {
+        if let Some((t, _)) = &self.peeked {
+            return Ok(t.clone());
+        }
+        let (t, l) = self.lx.next()?;
+        self.peeked = Some((t.clone(), l));
+        Ok(t)
     }
 
     fn eat(&mut self, t: Tok) -> Result<(), String> {
@@ -110,7 +132,7 @@ impl<'a> Parser<'a> {
     }
 
     fn is_print_like(&self) -> bool {
-        // print/printf are idents in our lexer? No — we need keywords.
+        // print/printf are idents in our lexer? No - we need keywords.
         // We treat Ident("print") specially.
         matches!(&self.cur, Tok::Ident(s) if s == "print" || s == "printf")
     }
@@ -129,9 +151,7 @@ impl<'a> Parser<'a> {
                 _ => return Err(format!("line {}: expected regex", self.line)),
             };
             // re-advance: lex_regex consumed, next token is after /
-            let (t2, l2) = self.lx.next()?;
-            self.cur = t2;
-            self.line = l2;
+            self.advance()?;
             // range?
             if self.cur == Tok::Comma {
                 self.bump()?;
@@ -153,9 +173,7 @@ impl<'a> Parser<'a> {
                     _ => return Err(format!("line {}: expected regex", self.line)),
                 };
                 self.line = l;
-                let (t2, l2) = self.lx.next()?;
-                self.cur = t2;
-                self.line = l2;
+                self.advance()?;
                 Expr::Str(re)
             } else {
                 self.parse_expr()?
@@ -242,6 +260,10 @@ impl<'a> Parser<'a> {
                 self.bump()?;
                 Ok(Stmt::Next)
             }
+            Tok::Nextfile => {
+                self.bump()?;
+                Ok(Stmt::Nextfile)
+            }
             Tok::Exit => {
                 self.bump()?;
                 let e = if self.expr_start() {
@@ -271,7 +293,15 @@ impl<'a> Parser<'a> {
                 };
                 if self.cur == Tok::LBracket {
                     self.bump()?;
-                    let idx = self.parse_expr()?;
+                    let mut idx = self.parse_expr()?;
+                    if self.cur == Tok::Comma {
+                        let mut list = vec![idx];
+                        while self.cur == Tok::Comma {
+                            self.bump()?;
+                            list.push(self.parse_expr()?);
+                        }
+                        idx = Expr::Sublist(list);
+                    }
                     self.eat(Tok::RBracket)?;
                     Ok(Stmt::Delete(name, Some(idx)))
                 } else {
@@ -282,7 +312,7 @@ impl<'a> Parser<'a> {
             Tok::Ident(s) if s == "printf" => self.parse_print(true),
             _ => {
                 let e = self.parse_expr()?;
-                // implicit print? no — expression statement
+                // implicit print? no - expression statement
                 Ok(Stmt::Expr(e))
             }
         }
@@ -312,7 +342,7 @@ impl<'a> Parser<'a> {
                 let body = Box::new(self.parse_statement()?);
                 return Ok(Stmt::ForIn(vec![name], arr, body));
             }
-            // re-parse as expression: we already consumed ident — rebuild
+            // re-parse as expression: we already consumed ident - rebuild
             let mut e = Expr::Var(name);
             e = self.parse_postfix_after_ident(e)?;
             e = self.parse_bin_rhs(0, e)?;
@@ -347,12 +377,20 @@ impl<'a> Parser<'a> {
             match &self.cur {
                 Tok::LBracket => {
                     self.bump()?;
-                    let idx = self.parse_expr()?;
+                    let mut idx = self.parse_expr()?;
+                    if self.cur == Tok::Comma {
+                        let mut list = vec![idx];
+                        while self.cur == Tok::Comma {
+                            self.bump()?;
+                            list.push(self.parse_expr()?);
+                        }
+                        idx = Expr::Sublist(list);
+                    }
                     self.eat(Tok::RBracket)?;
                     e = Expr::Index(Box::new(e), Box::new(idx));
                 }
                 Tok::LParen => {
-                    // call — only if e is Var
+                    // call - only if e is Var
                     if let Expr::Var(name) = &e {
                         let name = name.clone();
                         self.bump()?;
@@ -490,12 +528,42 @@ impl<'a> Parser<'a> {
 
     fn parse_or(&mut self) -> Result<Expr, String> {
         let mut e = self.parse_and()?;
-        while self.cur == Tok::OrOr {
-            self.bump()?;
-            let r = self.parse_and()?;
-            e = Expr::Or(Box::new(e), Box::new(r));
+        loop {
+            if self.cur == Tok::OrOr {
+                self.bump()?;
+                let r = self.parse_and()?;
+                e = Expr::Or(Box::new(e), Box::new(r));
+            } else if matches!(&self.cur, Tok::Ident(s) if s == "|") && matches!(self.peek()?, Tok::Getline) {
+                // `cmd | getline [var]`: the left side is the command
+                self.bump()?;
+                self.bump()?; // getline
+                let target = self.parse_getline_target()?;
+                e = Expr::Call(
+                    "getline".into(),
+                    vec![target, Expr::Call("|".into(), vec![e])],
+                );
+            } else {
+                break;
+            }
         }
         Ok(e)
+    }
+
+    /// Variable part of a getline, defaults to $0.
+    fn parse_getline_target(&mut self) -> Result<Expr, String> {
+        match &self.cur {
+            Tok::Ident(name) => {
+                let n = name.clone();
+                self.bump()?;
+                Ok(Expr::Var(n))
+            }
+            Tok::Dollar => {
+                self.bump()?;
+                let f = self.parse_unary()?;
+                Ok(Expr::Field(Box::new(f)))
+            }
+            _ => Ok(Expr::Var("$0".into())),
+        }
     }
 
     fn parse_and(&mut self) -> Result<Expr, String> {
@@ -512,7 +580,7 @@ impl<'a> Parser<'a> {
     fn parse_in(&mut self) -> Result<Expr, String> {
         let e = self.parse_not()?;
         if self.cur == Tok::In {
-            // only valid as relational — handled in parse_cmp via flag
+            // only valid as relational - handled in parse_cmp via flag
             // Actually POSIX: `primary in array` is a relational expr.
             // We handle after not-level by checking in parse_cmp.
         }
@@ -568,9 +636,7 @@ impl<'a> Parser<'a> {
                 Tok::Regex(r) => r,
                 _ => return Err(format!("line {}: expected regex", self.line)),
             };
-            let (t2, l2) = self.lx.next()?;
-            self.cur = t2;
-            self.line = l2;
+            self.advance()?;
             return Ok(Expr::Regex(re));
         }
         // /re/ as string also appears as Str after lex in some positions
@@ -713,7 +779,15 @@ impl<'a> Parser<'a> {
             match &self.cur {
                 Tok::LBracket => {
                     self.bump()?;
-                    let idx = self.parse_expr()?;
+                    let mut idx = self.parse_expr()?;
+                    if self.cur == Tok::Comma {
+                        let mut list = vec![idx];
+                        while self.cur == Tok::Comma {
+                            self.bump()?;
+                            list.push(self.parse_expr()?);
+                        }
+                        idx = Expr::Sublist(list);
+                    }
                     self.eat(Tok::RBracket)?;
                     e = Expr::Index(Box::new(e), Box::new(idx));
                 }
@@ -772,9 +846,7 @@ impl<'a> Parser<'a> {
                 let (tok, l) = self.lx.lex_regex()?;
                 match tok {
                     Tok::Regex(r) => {
-                        let (t2, l2) = self.lx.next()?;
-                        self.cur = t2;
-                        self.line = l2;
+                        self.advance()?;
                         let _ = l;
                         Ok(Expr::Regex(r))
                     }
@@ -794,20 +866,24 @@ impl<'a> Parser<'a> {
                 self.bump()?;
                 let saved = self.no_gt;
                 self.no_gt = false;
-                let e = self.parse_expr()?;
+                let mut e = self.parse_expr()?;
+                if self.cur == Tok::Comma {
+                    // `(i,j) in arr` subscript list
+                    let mut list = vec![e];
+                    while self.cur == Tok::Comma {
+                        self.bump()?;
+                        list.push(self.parse_expr()?);
+                    }
+                    e = Expr::Sublist(list);
+                }
                 self.no_gt = saved;
                 self.eat(Tok::RParen)?;
                 Ok(e)
             }
             Tok::Getline => {
-                // getline as expression: simplified
-                self.bump()?;
                 // getline [var] [< file | | cmd]
-                let mut var = None;
-                if let Tok::Ident(name) = &self.cur {
-                    var = Some(name.clone());
-                    self.bump()?;
-                }
+                self.bump()?;
+                let target = self.parse_getline_target()?;
                 let src = if self.cur == Tok::Lt {
                     self.bump()?;
                     let f = self.parse_concat()?;
@@ -819,7 +895,6 @@ impl<'a> Parser<'a> {
                 } else {
                     None
                 };
-                let target = var.map(Expr::Var).unwrap_or_else(|| Expr::Var("$0".into()));
                 Ok(Expr::Call(
                     "getline".into(),
                     {
@@ -844,7 +919,7 @@ impl<'a> Parser<'a> {
         let _ = min_prec;
         let e = self.parse_postfix_after_ident(lhs)?;
         // then continue with unary-level operators by feeding into full chain:
-        // simplest: wrap back through cmp — not perfect but for-init is simple assigns
+        // simplest: wrap back through cmp - not perfect but for-init is simple assigns
         let _ = e.clone();
         // re-enter at add level via a hack: put expression through parse_cmp-like
         // We'll just return and let caller use parse_expr-style:
@@ -1017,6 +1092,6 @@ fn split_functions(src: &str) -> Result<(Vec<FuncDef>, String), String> {
 }
 
 fn lx_pos(lx: &Lexer) -> usize {
-    // expose pos via a method — add to Lexer
+    // expose pos via a method - add to Lexer
     lx.pos()
 }

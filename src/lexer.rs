@@ -23,6 +23,7 @@ pub enum Tok {
     Return,
     Delete,
     Getline,
+    Nextfile,
     LBrace,
     RBrace,
     LParen,
@@ -71,11 +72,13 @@ pub struct Lexer<'a> {
     pos: usize,
     line: usize,
     pending_newline: bool,
+    // whether a `/` at the current position starts a regex literal
+    prev_regex_ok: bool,
 }
 
 impl<'a> Lexer<'a> {
     pub fn new(src: &'a str) -> Self {
-        Lexer { src: src.as_bytes(), pos: 0, line: 1, pending_newline: false }
+        Lexer { src: src.as_bytes(), pos: 0, line: 1, pending_newline: false, prev_regex_ok: true }
     }
 
     pub fn line(&self) -> usize {
@@ -129,6 +132,12 @@ impl<'a> Lexer<'a> {
     /// Next token; Newline tokens separate statements when needed.
     #[allow(clippy::should_implement_trait)]
     pub fn next(&mut self) -> Result<(Tok, usize), String> {
+        let r = self.next_tok()?;
+        self.prev_regex_ok = regex_ok_after(&r.0);
+        Ok(r)
+    }
+
+    fn next_tok(&mut self) -> Result<(Tok, usize), String> {
         if self.pending_newline {
             self.pending_newline = false;
             return Ok((Tok::Newline, self.line));
@@ -230,6 +239,10 @@ impl<'a> Lexer<'a> {
                 if self.peek() == Some(b'=') {
                     self.pos += 1;
                     Ok((Tok::DivAssign, start_line))
+                } else if self.prev_regex_ok {
+                    // step back over the slash already consumed, then lex a regex
+                    self.pos -= 1;
+                    self.lex_regex()
                 } else {
                     Ok((Tok::Slash, start_line))
                 }
@@ -378,6 +391,29 @@ impl<'a> Lexer<'a> {
 
     fn lex_number(&mut self, line: usize) -> Result<(Tok, usize), String> {
         let begin = self.pos;
+        // 0x1f style hex literal
+        if self.peek() == Some(b'0')
+            && matches!(self.peek2(), Some(b'x') | Some(b'X'))
+            && self.src.get(self.pos + 2).copied().is_some_and(|c| c.is_ascii_hexdigit())
+        {
+            self.pos += 2;
+            while self.peek().is_some_and(|c| c.is_ascii_hexdigit()) {
+                self.pos += 1;
+            }
+            let s = std::str::from_utf8(&self.src[begin + 2..self.pos]).unwrap();
+            let n = u64::from_str_radix(s, 16).unwrap_or(0);
+            return Ok((Tok::Num(n as f64), line));
+        }
+        // gawk has no binary literals: 0b101 parses as 0
+        if self.peek() == Some(b'0') && matches!(self.peek2(), Some(b'b') | Some(b'B'))
+            && matches!(self.src.get(self.pos + 2), Some(b'0' | b'1'))
+        {
+            self.pos += 2;
+            while matches!(self.peek(), Some(b'0') | Some(b'1')) {
+                self.pos += 1;
+            }
+            return Ok((Tok::Num(0.0), line));
+        }
         while let Some(c) = self.peek() {
             if c.is_ascii_digit() || c == b'.' {
                 self.pos += 1;
@@ -445,7 +481,7 @@ impl<'a> Lexer<'a> {
                 }
             }
         }
-        // optional flags i, m — store as part of pattern string with (?i) prefix later
+        // optional flags i, m - store as part of pattern string with (?i) prefix later
         let mut flags = String::new();
         while let Some(c) = self.peek() {
             if c == b'i' || c == b'm' || c == b'x' {
@@ -469,6 +505,17 @@ impl<'a> Lexer<'a> {
     }
 }
 
+/// True when a `/` after this token starts a regex literal rather than
+/// being the division operator.
+fn regex_ok_after(t: &Tok) -> bool {
+    match t {
+        Tok::Num(_) | Tok::Str(_) | Tok::Regex(_) | Tok::RParen | Tok::RBracket
+        | Tok::Inc | Tok::Dec => false,
+        Tok::Ident(s) => matches!(s.as_str(), "print" | "printf"),
+        _ => true,
+    }
+}
+
 fn keyword(s: &str) -> Option<Tok> {
     Some(match s {
         "BEGIN" => Tok::Begin,
@@ -487,6 +534,7 @@ fn keyword(s: &str) -> Option<Tok> {
         "return" => Tok::Return,
         "delete" => Tok::Delete,
         "getline" => Tok::Getline,
+        "nextfile" => Tok::Nextfile,
         _ => return None,
     })
 }

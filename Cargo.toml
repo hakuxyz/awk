@@ -25,3 +25,8 @@ path = "src/lib.rs"
 lto = "thin"
 codegen-units = 1
 strip = true
+
+[dependencies.chrono]
+version = "0.4"
+default-features = false
+features = ["clock", "std"]

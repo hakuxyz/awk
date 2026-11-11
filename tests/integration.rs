@@ -181,3 +181,191 @@ fn gawk_differential_sum_squares() {
     assert_eq!(c1, 0);
     assert_eq!(mine, String::from_utf8_lossy(&out.stdout));
 }
+
+// ----- GNU extensions and edge cases -----
+
+#[test]
+fn hex_literal() {
+    let (out, _) = awk(r#"BEGIN { printf "%c|%d\n", 0x263a, 0x41 }"#, "");
+    assert_eq!(out, "\u{263a}|65\n");
+}
+
+#[test]
+fn binary_literal_is_zero() {
+    // gawk has no 0b literals and evaluates them to 0
+    let (out, _) = awk(r#"BEGIN { print 0b101 }"#, "");
+    assert_eq!(out, "0\n");
+}
+
+#[test]
+fn gensub_group_swap() {
+    let (out, _) = awk(r#"BEGIN { print gensub(/(.)(.)/, "[\\2\\1]", "g", "abcd") }"#, "");
+    assert_eq!(out, "[ba][dc]\n");
+}
+
+#[test]
+fn gensub_nth_match() {
+    let (out, _) = awk(r#"BEGIN { print gensub(/a/, "X", 3, "aaaa") }"#, "");
+    assert_eq!(out, "aaXa\n");
+}
+
+#[test]
+fn nextfile_skips_rest_of_file() {
+    let exe = env!("CARGO_BIN_EXE_awk");
+    let dir = std::env::temp_dir();
+    let f1 = dir.join("awk_nf1.txt");
+    let f2 = dir.join("awk_nf2.txt");
+    std::fs::write(&f1, "alpha\nbeta\n").unwrap();
+    std::fs::write(&f2, "gamma\n").unwrap();
+    let out = Command::new(exe)
+        .args([
+            "{ print $0; nextfile } END { print NR }",
+            f1.to_str().unwrap(),
+            f2.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "alpha\ngamma\n2\n"
+    );
+    let _ = std::fs::remove_file(&f1);
+    let _ = std::fs::remove_file(&f2);
+}
+
+#[test]
+fn getline_file_handle_stays_open_at_eof() {
+    let exe = env!("CARGO_BIN_EXE_awk");
+    let dir = std::env::temp_dir();
+    let f = dir.join("awk_gl.txt");
+    std::fs::write(&f, "one\ntwo\n").unwrap();
+    let prog = format!(
+        "BEGIN {{ n=0; while ((getline l < \"{}\") > 0) n++; print n; print (getline z < \"{}\"); close(\"{}\"); print (getline l < \"{}\"), l }}",
+        f.display(),
+        f.display(),
+        f.display(),
+        f.display()
+    );
+    let out = Command::new(exe).arg(&prog).output().unwrap();
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "2\n0\n1 one\n");
+    let _ = std::fs::remove_file(&f);
+}
+
+#[test]
+fn division_by_zero_is_fatal() {
+    let (out, code) = awk(r#"BEGIN { print 1/0 }"#, "");
+    assert_eq!(out, "");
+    assert_eq!(code, 2);
+}
+
+#[test]
+fn modulo_by_zero_is_fatal() {
+    let (_, code) = awk(r#"BEGIN { print 5%0 }"#, "");
+    assert_eq!(code, 2);
+}
+
+#[test]
+fn user_function_takes_fewer_args() {
+    let (out, code) = awk(r#"BEGIN { print f(1) } function f(a, b) { return a + b }"#, "");
+    assert_eq!(out, "1\n");
+    assert_eq!(code, 0);
+}
+
+#[test]
+fn typeof_distinguishes_unassigned() {
+    let (out, _) = awk(r#"BEGIN { print typeof(u), typeof($9) }"#, "");
+    assert_eq!(out, "untyped unassigned\n");
+}
+
+#[test]
+fn typeof_array_element() {
+    let (out, _) = awk(r#"BEGIN { a[1]; print typeof(a[1]) }"#, "");
+    assert_eq!(out, "unassigned\n");
+}
+
+#[test]
+fn rstart_counts_characters() {
+    let (out, _) = awk(r#"BEGIN { print match("héllo", /l+/), RSTART, RLENGTH }"#, "");
+    assert_eq!(out, "3 3 2\n");
+}
+
+#[test]
+fn infinity_prints_with_sign() {
+    let (out, _) = awk(r#"BEGIN { x = 1e308 * 10; print x, -x, (x - x) }"#, "");
+    assert_eq!(out, "+inf -inf -nan\n");
+}
+
+#[test]
+fn printf_literal_percent() {
+    let (out, _) = awk(r#"BEGIN { printf "100%% sure\n" }"#, "");
+    assert_eq!(out, "100% sure\n");
+}
+
+#[test]
+fn printf_unknown_spec_is_literal() {
+    let (out, _) = awk(r#"BEGIN { printf "%p|%q|%%\n", 65 }"#, "");
+    assert_eq!(out, "%p|%q|%\n");
+}
+
+#[test]
+fn v_value_with_blanks_is_strnum() {
+    let exe = env!("CARGO_BIN_EXE_awk");
+    let out = Command::new(exe)
+        .args(["-v", "x= 7 ", "BEGIN { print typeof(x) }"])
+        .output()
+        .unwrap();
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "strnum\n");
+}
+
+#[test]
+fn gsub_literal_target_only_counts() {
+    let (out, code) = awk(r#"BEGIN { print gsub(/a/, "b", "aabbcc") }"#, "");
+    assert_eq!(out, "2\n");
+    assert_eq!(code, 0);
+}
+
+#[test]
+fn asorti_sorts_index_strings() {
+    let (out, _) = awk(
+        r#"BEGIN { a[10]="x"; a[9]="y"; a[2]="z"; print asorti(a); print a[1], a[2], a[3] }"#,
+        "",
+    );
+    assert_eq!(out, "3\n10 2 9\n");
+}
+
+#[test]
+fn multi_subscript_joins_with_subsep() {
+    let (out, _) = awk(
+        r#"BEGIN { a[1,2] = "x"; print a[1,2]; print (1,2) in a; delete a[1,2]; print length(a) }"#,
+        "",
+    );
+    assert_eq!(out, "x\n1\n0\n");
+}
+
+#[test]
+fn strtonum_prefixes() {
+    let (out, _) = awk(
+        r#"BEGIN { print strtonum("0x1F"), strtonum("010"), strtonum("018"), strtonum("0b101") }"#,
+        "",
+    );
+    assert_eq!(out, "31 8 18 0\n");
+}
+
+#[test]
+fn strftime_and_mktime_roundtrip() {
+    let (out, _) = awk(
+        r#"BEGIN { t = mktime("2001 02 03 04 05 06"); print strftime("%Y%m%d%H%M%S", t) }"#,
+        "",
+    );
+    assert_eq!(out, "20010203040506\n");
+}
+
+#[test]
+fn bitwise_gnu_functions() {
+    // compl masks to 53 bits, so compl(0) is 2^53 - 1, exactly like gawk
+    let (out, _) = awk(
+        r#"BEGIN { print compl(0), and(5, 3), or(1, 2), xor(5, 3), lshift(1, 4), rshift(16, 2) }"#,
+        "",
+    );
+    assert_eq!(out, "9007199254740991 1 3 6 16 4\n");
+}

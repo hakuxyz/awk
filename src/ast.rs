@@ -18,7 +18,7 @@ pub enum Pattern {
     Begin,
     End,
     Expr(Expr),
-    // range pattern: expr1, expr2 — active until expr2 true
+    // range pattern: expr1, expr2 - active until expr2 true
     Range(Expr, Expr),
     Regex(String),
 }
@@ -35,6 +35,7 @@ pub enum Stmt {
     Break,
     Continue,
     Next,
+    Nextfile,
     Exit(Option<Expr>),
     Return(Option<Expr>),
     Delete(String, Option<Expr>),
@@ -70,6 +71,7 @@ pub enum Expr {
     Var(String),
     Field(Box<Expr>),
     Index(Box<Expr>, Box<Expr>), // a[i]
+    Sublist(Vec<Expr>),          // a[i,j] subscript joined with SUBSEP
     Assign(Box<Expr>, Box<Expr>),
     PlusAssign(Box<Expr>, Box<Expr>),
     MinusAssign(Box<Expr>, Box<Expr>),
@@ -103,7 +105,7 @@ pub enum Expr {
     Ternary(Box<Expr>, Box<Expr>, Box<Expr>),
     Call(String, Vec<Expr>),
     // builtin calls handled as Call with special names
-    InArray(Box<Expr>, String), // x in arr — as expression
+    InArray(Box<Expr>, String), // x in arr - as expression
 }
 
 /// Function definition.

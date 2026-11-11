@@ -13,29 +13,32 @@ pub struct Scalar {
     pub strnum: bool,
     /// true if never assigned (uninitialized)
     pub uninit: bool,
+    /// true if the value is a number, string part derived via CONVFMT
+    pub numval: bool,
 }
 
 impl Scalar {
     pub fn empty() -> Self {
-        Scalar { s: String::new(), n: 0.0, strnum: false, uninit: true }
+        Scalar { s: String::new(), n: 0.0, strnum: false, uninit: true, numval: false }
     }
 
     #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: impl Into<String>) -> Self {
         let s = s.into();
         let n = parse_num(&s);
-        Scalar { s, n, strnum: false, uninit: false }
+        Scalar { s, n, strnum: false, uninit: false, numval: false }
     }
 
     pub fn from_num(n: f64) -> Self {
-        Scalar { s: num_to_str(n), n, strnum: false, uninit: false }
+        Scalar { s: num_to_str(n), n, strnum: false, uninit: false, numval: true }
     }
 
     pub fn from_input(s: impl Into<String>) -> Self {
         let s = s.into();
         let n = parse_num(&s);
-        let looks = !s.is_empty() && s.trim() == s && num_strict(&s);
-        Scalar { s, n, strnum: looks, uninit: false }
+        // input values keep leading/trailing blanks and still count as strnum
+        let looks = num_strict(s.trim());
+        Scalar { s, n, strnum: looks, uninit: false, numval: false }
     }
 
     /// Numeric value for arithmetic (uninit -> 0).
@@ -70,6 +73,7 @@ impl Scalar {
         self.s = num_to_str(n);
         self.strnum = false;
         self.uninit = false;
+        self.numval = true;
     }
 
     pub fn set_str(&mut self, s: impl Into<String>) {
@@ -77,6 +81,7 @@ impl Scalar {
         self.n = parse_num(&self.s);
         self.strnum = false;
         self.uninit = false;
+        self.numval = false;
     }
 
     pub fn set_input(&mut self, s: impl Into<String>) {
@@ -85,6 +90,7 @@ impl Scalar {
         self.strnum = !s.is_empty() && s.trim() == s && num_strict(&s);
         self.s = s;
         self.uninit = false;
+        self.numval = false;
     }
 }
 
@@ -137,17 +143,44 @@ impl Value {
     }
 }
 
-/// Parse awk numeric string: leading whitespace, optional sign, digits, optional frac/exp.
-fn parse_num(s: &str) -> f64 {
+/// Parse awk numeric string: longest valid numeric prefix (POSIX).
+pub(crate) fn parse_num(s: &str) -> f64 {
     let t = s.trim_start();
-    if t.is_empty() {
+    let b = t.as_bytes();
+    let mut i = 0;
+    if i < b.len() && (b[i] == b'+' || b[i] == b'-') {
+        i += 1;
+    }
+    let mut digits = false;
+    while i < b.len() && b[i].is_ascii_digit() {
+        digits = true;
+        i += 1;
+    }
+    if i < b.len() && b[i] == b'.' {
+        i += 1;
+        while i < b.len() && b[i].is_ascii_digit() {
+            digits = true;
+            i += 1;
+        }
+    }
+    if !digits {
         return 0.0;
     }
-    match t.parse::<f64>() {
-        Ok(n) if num_strict_prefix_ok(t, n) => n,
-        Ok(_) => 0.0,
-        Err(_) => 0.0,
+    if i < b.len() && (b[i] == b'e' || b[i] == b'E') {
+        let mut j = i + 1;
+        if j < b.len() && (b[j] == b'+' || b[j] == b'-') {
+            j += 1;
+        }
+        let mut ed = false;
+        while j < b.len() && b[j].is_ascii_digit() {
+            ed = true;
+            j += 1;
+        }
+        if ed {
+            i = j;
+        }
     }
+    t[..i].parse::<f64>().unwrap_or(0.0)
 }
 
 /// True if entire string is a valid awk number (for strnum detection).
@@ -192,10 +225,6 @@ fn num_strict(s: &str) -> bool {
     i == b.len()
 }
 
-fn num_strict_prefix_ok(_t: &str, _n: f64) -> bool {
-    true
-}
-
 /// Format number the way awk does (16 significant digits-ish).
 pub fn num_to_str(n: f64) -> String {
     if n == n.trunc() && n.abs() < 1e15 {
@@ -209,22 +238,41 @@ pub fn num_to_str(n: f64) -> String {
     }
 }
 
-/// Compare two scalars per awk rules (numeric if both strnum/num).
+/// True when the scalar participates in numeric comparison (number or strnum).
+pub fn is_numlike(s: &Scalar) -> bool {
+    !s.uninit && (s.numval || s.strnum)
+}
+
+/// Compare two scalars per awk rules: uninit equals 0 and "", numbers
+/// compare numerically, everything else compares as string.
 pub fn cmp_scalar(a: &Scalar, b: &Scalar) -> std::cmp::Ordering {
-    let both_num = (!a.uninit && a.strnum) || (!a.uninit && !a.is_str())
-        && ((!b.uninit && b.strnum) || (!b.uninit && !b.is_str()));
-    // simplify: if both look numeric as values
-    let a_num = !a.uninit && (a.strnum || !a.is_str() && num_strict(a.as_str()));
-    let b_num = !b.uninit && (b.strnum || !b.is_str() && num_strict(b.as_str()));
-    let _ = both_num;
-    if a_num && b_num {
-        a.num().partial_cmp(&b.num()).unwrap_or(std::cmp::Ordering::Equal)
-    } else {
-        a.as_str().cmp(b.as_str())
+    match (a.uninit, b.uninit) {
+        (true, true) => std::cmp::Ordering::Equal,
+        (true, false) => {
+            if is_numlike(b) {
+                0.0_f64.partial_cmp(&b.num()).unwrap_or(std::cmp::Ordering::Equal)
+            } else {
+                "".cmp(b.as_str())
+            }
+        }
+        (false, true) => {
+            if is_numlike(a) {
+                a.num().partial_cmp(&0.0).unwrap_or(std::cmp::Ordering::Equal)
+            } else {
+                a.as_str().cmp("")
+            }
+        }
+        (false, false) => {
+            if is_numlike(a) && is_numlike(b) {
+                a.num().partial_cmp(&b.num()).unwrap_or(std::cmp::Ordering::Equal)
+            } else {
+                a.as_str().cmp(b.as_str())
+            }
+        }
     }
 }
 
 /// True if scalar should be treated as number in boolean context.
 pub fn cmp_ok_num(s: &Scalar) -> bool {
-    !s.uninit && (s.strnum || num_strict(s.as_str()))
+    is_numlike(s)
 }

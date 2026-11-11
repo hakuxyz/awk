@@ -2,7 +2,92 @@
 
 use awk::interp::Interp;
 use awk::parser::parse_full;
+use awk::value::Scalar;
+use awk::Value;
 use std::io::Write;
+
+/// Process backslash escapes in a -v value or -F field separator.
+fn unescape(s: &str) -> String {
+    let mut out = String::new();
+    let b = s.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] != b'\\' {
+            let l = utf8_len(b[i]);
+            out.push_str(std::str::from_utf8(&b[i..i + l]).unwrap_or(""));
+            i += l;
+            continue;
+        }
+        i += 1;
+        if i >= b.len() {
+            out.push('\\');
+            break;
+        }
+        let c = b[i];
+        i += 1;
+        match c {
+            b'\\' => out.push('\\'),
+            b'a' => out.push('\u{7}'),
+            b'b' => out.push('\u{8}'),
+            b'f' => out.push('\u{c}'),
+            b'n' => out.push('\n'),
+            b'r' => out.push('\r'),
+            b't' => out.push('\t'),
+            b'v' => out.push('\u{b}'),
+            b'/' => out.push('/'),
+            b'x' => {
+                let mut v = 0u32;
+                let mut n = 0;
+                while n < 2 && i < b.len() {
+                    if let Some(d) = (b[i] as char).to_digit(16) {
+                        v = v * 16 + d;
+                        i += 1;
+                        n += 1;
+                    } else {
+                        break;
+                    }
+                }
+                if n == 0 {
+                    out.push('x');
+                } else {
+                    out.push(char::from_u32(v).unwrap_or('\0'));
+                }
+            }
+            b'0'..=b'7' => {
+                let mut v = (c - b'0') as u32;
+                let mut n = 1;
+                while n < 3 && i < b.len() && (b'0'..=b'7').contains(&b[i]) {
+                    v = v * 8 + (b[i] - b'0') as u32;
+                    i += 1;
+                    n += 1;
+                }
+                out.push(char::from_u32(v).unwrap_or('\0'));
+            }
+            // unknown escapes keep the letter, like gawk
+            other => {
+                let l = utf8_len(other);
+                if l == 1 {
+                    out.push(other as char);
+                } else {
+                    i += l - 1;
+                }
+            }
+        }
+    }
+    out
+}
+
+fn utf8_len(b: u8) -> usize {
+    if b < 0x80 {
+        1
+    } else if b >> 5 == 0b110 {
+        2
+    } else if b >> 4 == 0b1110 {
+        3
+    } else {
+        4
+    }
+}
 
 fn usage() -> ! {
     eprintln!(
@@ -116,18 +201,11 @@ fn main() {
 
     let mut interp = Interp::new(funcs, rules);
     if let Some(f) = fs {
-        interp.fs = f;
+        interp.fs = unescape(&f);
     }
     for (k, v) in assigns {
-        match k.as_str() {
-            "FS" => interp.fs = v,
-            "OFS" => interp.ofs = v,
-            "ORS" => interp.ors = v,
-            "SUBSEP" => interp.subsep = v,
-            _ => {
-                interp.globals.insert(k, awk::Value::str(v));
-            }
-        }
+        // -v values look like input fields: numeric ones become strnum
+        interp.set_var(&k, Value::Scalar(Scalar::from_input(unescape(&v))));
     }
 
     let code = interp.run(&positional);
